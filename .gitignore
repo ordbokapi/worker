@@ -1,0 +1,4 @@
+/target
+.redis
+.redis-backup
+.env

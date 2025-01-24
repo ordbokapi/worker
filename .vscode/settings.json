@@ -1,0 +1,27 @@
+{
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "editor.formatOnSave": true,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": [
+    "--",
+    "-D",
+    "clippy::suspicious",
+    "-D",
+    "clippy::style",
+    "-D",
+    "clippy::complexity",
+    "-D",
+    "clippy::perf",
+    "-D",
+    "clippy::dbg_macro",
+    "-D",
+    "clippy::todo",
+    "-D",
+    "clippy::unimplemented",
+    "-D",
+    "warnings"
+  ]
+}
