@@ -32,11 +32,14 @@ RUN cargo build --release --features matrix_notifs
 FROM debian:stable-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libssl3 tini ca-certificates && rm -rf /var/lib/apt/lists/* && update-ca-certificates
 
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker
 
 # Set the entrypoint
-ENTRYPOINT ["ordbokapi-worker"]
-CMD ["-l", "info"]
+# ENTRYPOINT ["/usr/bin/tini", "--", "ordbokapi-worker"]
+# CMD []
+
+# Use CMD — Heroku only supports attaching a console if the container doesn't set ENTRYPOINT
+CMD ["/usr/bin/tini", "--", "ordbokapi-worker"]
