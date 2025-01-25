@@ -31,6 +31,9 @@ RUN cargo build --release --all-features
 # FROM gcr.io/distroless/base-debian12 # Can be used when statically linking with MUSL
 FROM debian:stable-slim
 
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker
 
