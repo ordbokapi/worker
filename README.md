@@ -19,4 +19,6 @@ Arbeidarprosessen for å synkronisere dataa frå UiB med Ordbok API sin database
 - `./register-bot.sh` eller `.\register-bot.ps1` for å registrere ein Matrix bott-konto du kan bruke til å sende varsel. (Krev at du har [Powershell](;https://learn.microsoft.com/powershell/scripting/install/installing-powershell) installert, sjølv om du brukar Linux eller MacOS.)
 - `./check.sh` eller `.\check.ps1` for å sjekke kode for stilfeil og andre problem med `clippy` og `cargo fmt`. Det er tilrådd å køyre dette minst ein gong med og utan valfrie funksjonar ([cargo features](https://doc.rust-lang.org/cargo/reference/features.html)) før du opnar ein pull request.
 
+## Lisens
+
 [ISC](LICENCE)
