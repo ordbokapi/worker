@@ -28,7 +28,8 @@ RUN cargo build --release --all-features
 # Run stage
 # -----------------------------------------
 
-FROM gcr.io/distroless/base-debian12
+# FROM gcr.io/distroless/base-debian12 # Can be used when statically linking with MUSL
+FROM debian:stable-slim
 
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker
