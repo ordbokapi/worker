@@ -39,4 +39,4 @@ COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /u
 
 # Set the entrypoint
 ENTRYPOINT ["ordbokapi-worker"]
-CMD []
+CMD ["-l", "info"]
