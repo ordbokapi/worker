@@ -1,1 +1,1 @@
-cargo run --features use_dotenv -- $args
+cargo run --all-features -- $args

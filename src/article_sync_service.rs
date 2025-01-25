@@ -5,6 +5,8 @@ use redis::{AsyncCommands, JsonAsyncCommands};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[cfg(feature = "matrix_notifs")]
+use crate::matrix_notify_service::MatrixNotifyService;
 use crate::queue::{JobPayload, JobQueue, JobQueueService};
 
 /// Dictionary variants for UiB
@@ -64,11 +66,21 @@ pub struct ArticleMetadata {
 pub struct ArticleSyncService {
     pub redis_client: redis::aio::ConnectionManager,
     pub job_queue: JobQueueService,
+    #[cfg(feature = "matrix_notifs")]
+    pub matrix_service: MatrixNotifyService,
 }
 
 /// Gets a dedup key for the article ID and dictionary.
 fn dedup_key(dict: UibDictionary, article_id: i64) -> String {
     format!("lock:article:{}:{}", dict.as_str(), article_id)
+}
+
+#[cfg(feature = "matrix_notifs")]
+struct ArticleListSyncResult {
+    dict: UibDictionary,
+    new_articles: u32,
+    updated_articles: u32,
+    missing_articles: u32,
 }
 
 impl ArticleSyncService {
@@ -138,6 +150,14 @@ impl ArticleSyncService {
         // Prepare a vector to hold all the JSON payloads for articles we need to sync.
         let mut payloads_to_enqueue = Vec::new();
 
+        #[cfg(feature = "matrix_notifs")]
+        let mut result = ArticleListSyncResult {
+            dict,
+            new_articles: 0,
+            updated_articles: 0,
+            missing_articles: 0,
+        };
+
         for raw_meta in article_list.iter() {
             let meta = self.convert_raw_article_metadata(raw_meta)?;
 
@@ -158,6 +178,10 @@ impl ArticleSyncService {
                             existing.updated_at,
                             meta.updated_at
                         );
+                        #[cfg(feature = "matrix_notifs")]
+                        {
+                            result.updated_articles += 1;
+                        }
                     }
                 } else {
                     // New revision
@@ -165,6 +189,10 @@ impl ArticleSyncService {
                         "[{:?}] Article {} ({}) has new revision in UiB list {:?} -> {:?}",
                         dict, meta.article_id, meta.primary_lemma, existing.revision, meta.revision
                     );
+                    #[cfg(feature = "matrix_notifs")]
+                    {
+                        result.updated_articles += 1;
+                    }
                 }
             } else {
                 // New article
@@ -172,6 +200,10 @@ impl ArticleSyncService {
                     "[{:?}] New article {} ({}) found in UiB list",
                     dict, meta.article_id, meta.primary_lemma
                 );
+                #[cfg(feature = "matrix_notifs")]
+                {
+                    result.new_articles += 1;
+                }
             }
 
             // Build the JSON payload to be passed enqueue_sync_article further down
@@ -223,6 +255,10 @@ impl ArticleSyncService {
                 "[{:?}] {} articles no longer in UiB list, will re-fetch to check for updates",
                 dict, missing_count
             );
+            #[cfg(feature = "matrix_notifs")]
+            {
+                result.missing_articles = missing_count;
+            }
         }
 
         let total = payloads_to_enqueue.len();
@@ -248,7 +284,16 @@ impl ArticleSyncService {
                 .await?;
         }
 
-        info!("[{:?}] Enqueued {} article fetch jobs", dict, total,);
+        info!("[{:?}] Enqueued {} article fetch jobs", dict, total);
+
+        #[cfg(feature = "matrix_notifs")]
+        {
+            let msg = format!(
+                "[{:?}] **Synkroniserer artiklar med UiB.**\n**Nye:** {}\n**Oppdaterte:** {}\n**Manglar i UiB-lista:** {}",
+                result.dict, result.new_articles, result.updated_articles, result.missing_articles
+            );
+            self.matrix_service.queue_message(&msg).await;
+        }
 
         Ok(())
     }

@@ -23,5 +23,6 @@
     "clippy::unimplemented",
     "-D",
     "warnings"
-  ]
+  ],
+  "rust-analyzer.cargo.features": "all"
 }

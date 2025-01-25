@@ -14,11 +14,13 @@ use crate::article_sync_service::UibDictionary;
 
 /// Represents a named queue.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-#[expect(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)]
 pub enum JobQueue {
     FetchArticleList,
     FetchArticle,
     FetchDictionaryMetadata,
+    #[cfg(feature = "matrix_notifs")]
+    MatrixNotify,
 }
 
 impl JobQueue {
@@ -27,6 +29,8 @@ impl JobQueue {
             JobQueue::FetchArticleList => "stream:fetch-article-list",
             JobQueue::FetchArticle => "stream:fetch-article",
             JobQueue::FetchDictionaryMetadata => "stream:fetch-dict-metadata",
+            #[cfg(feature = "matrix_notifs")]
+            JobQueue::MatrixNotify => "stream:matrix-notify",
         }
     }
 
@@ -35,6 +39,8 @@ impl JobQueue {
             JobQueue::FetchArticleList => "group:fetch-article-list",
             JobQueue::FetchArticle => "group:fetch-article",
             JobQueue::FetchDictionaryMetadata => "group:fetch-dict-metadata",
+            #[cfg(feature = "matrix_notifs")]
+            JobQueue::MatrixNotify => "group:matrix-notify",
         }
     }
 }
@@ -60,7 +66,10 @@ pub fn get_dict_id(job: &JobPayload) -> Result<UibDictionary> {
 }
 
 /// The result of XREADGROUP, a nested Vec.
-type XReadGroupResult = RedisResult<Option<Vec<(String, Vec<(String, HashMap<String, String>)>)>>>;
+type XReadGroupResultInner = Vec<(String, Vec<(String, HashMap<String, String>)>)>;
+
+/// The result of XREADGROUP, a nested Vec.
+type XReadGroupResult = RedisResult<Option<XReadGroupResultInner>>;
 
 #[derive(Clone)]
 pub struct JobQueueService {
@@ -80,6 +89,8 @@ impl JobQueueService {
             JobQueue::FetchArticleList,
             JobQueue::FetchArticle,
             JobQueue::FetchDictionaryMetadata,
+            #[cfg(feature = "matrix_notifs")]
+            JobQueue::MatrixNotify,
         ] {
             let stream_key = queue.to_stream_key();
             let group_name = queue.to_group_name();
@@ -351,94 +362,25 @@ impl JobQueueService {
 
                     trace!("[{consumer_name}] Waiting for job…");
 
-                    let res: XReadGroupResult = redis::cmd("XREADGROUP")
-                        .arg("GROUP")
-                        .arg(&group_name_clone)
-                        .arg(&consumer_name)
-                        .arg("BLOCK")
-                        .arg("2000")
-                        .arg("COUNT")
-                        .arg(max_messages_per_read.to_string())
-                        .arg("STREAMS")
-                        .arg(&stream_key_clone)
-                        .arg(">")
-                        .query_async(conn)
-                        .await;
-
-                    trace!("[{consumer_name}] Worker got job");
-
-                    match res {
+                    match xreadgroup_for_jobs(
+                        conn,
+                        &group_name_clone,
+                        &consumer_name,
+                        &stream_key_clone,
+                        max_messages_per_read,
+                    )
+                    .await
+                    {
                         Ok(Some(streams)) => {
-                            trace!("[{consumer_name}] Processing {} stream(s)", streams.len());
-                            // The structure is Vec<(stream_key, Vec<(entry_id, fields)>)>
-                            for (_stream, entries) in streams {
-                                trace!("[{consumer_name}] Processing {} entries", entries.len());
-                                for (entry_id, field_map) in entries {
-                                    // Parse the payload.
-                                    if let Some(payload_str) = field_map.get("payload") {
-                                        match serde_json::from_str::<Value>(payload_str) {
-                                            Ok(json_val) => {
-                                                let dedup_key = &json_val
-                                                    .get("dedupKey")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(|s| s.to_string());
-                                                let job_payload = JobPayload { data: json_val };
-
-                                                // Call job handler.
-                                                if let Err(e) = handler_clone(job_payload).await {
-                                                    error!("Job failed in {stream_key_clone} / {group_name_clone} / {consumer_name}: {e:?}");
-                                                    // May consider pushing to a dead-letter queue, etc., later?
-                                                } else {
-                                                    // If success, XACK
-                                                    let ack_res: RedisResult<i64> =
-                                                        redis::cmd("XACK")
-                                                            .arg(&stream_key_clone)
-                                                            .arg(&group_name_clone)
-                                                            .arg(&entry_id)
-                                                            .query_async(conn)
-                                                            .await;
-
-                                                    trace!(
-                                                        "[{consumer_name}] XACK {entry_id}: {:?}",
-                                                        ack_res
-                                                    );
-
-                                                    if let Err(e) = ack_res {
-                                                        error!("Failed XACK {entry_id}: {e}");
-                                                    } else {
-                                                        // Remove the dedup key so future attempts can re‐enqueue.
-                                                        if let Some(dedup_key) = dedup_key {
-                                                            let _: RedisResult<i32> =
-                                                                redis::cmd("DEL")
-                                                                    .arg(dedup_key)
-                                                                    .query_async(conn)
-                                                                    .await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Invalid JSON in job payload: {e}");
-                                                // Possibly XACK or push to dead-letter.
-                                                let _: RedisResult<i64> = redis::cmd("XACK")
-                                                    .arg(&stream_key_clone)
-                                                    .arg(&group_name_clone)
-                                                    .arg(&entry_id)
-                                                    .query_async(conn)
-                                                    .await;
-                                            }
-                                        }
-                                    } else {
-                                        // Missing 'payload' field.
-                                        warn!("No payload field in entry {entry_id}");
-                                        let _: RedisResult<i64> = redis::cmd("XACK")
-                                            .arg(&stream_key_clone)
-                                            .arg(&group_name_clone)
-                                            .arg(&entry_id)
-                                            .query_async(conn)
-                                            .await;
-                                    }
-                                }
+                            let mut params = WorkerParams {
+                                conn,
+                                handler: &handler_clone,
+                                stream_key: &stream_key_clone,
+                                group_name: &group_name_clone,
+                                consumer_name: &consumer_name,
+                            };
+                            if let Err(e) = process_entries(&mut params, streams).await {
+                                error!("Error processing entries: {:?}", e);
                             }
                         }
                         Ok(None) => {
@@ -454,5 +396,102 @@ impl JobQueueService {
         }
 
         Ok(())
+    }
+}
+
+struct WorkerParams<'a, F> {
+    conn: &'a mut redis::aio::ConnectionManager,
+    handler: &'a F,
+    stream_key: &'a str,
+    group_name: &'a str,
+    consumer_name: &'a str,
+}
+
+async fn xreadgroup_for_jobs(
+    conn: &mut redis::aio::ConnectionManager,
+    group_name: &str,
+    consumer_name: &str,
+    stream_key: &str,
+    max_messages: usize,
+) -> XReadGroupResult {
+    redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(group_name)
+        .arg(consumer_name)
+        .arg("BLOCK")
+        .arg("2000")
+        .arg("COUNT")
+        .arg(max_messages.to_string())
+        .arg("STREAMS")
+        .arg(stream_key)
+        .arg(">")
+        .query_async(conn)
+        .await
+}
+
+async fn process_entries<F, Fut>(
+    params: &mut WorkerParams<'_, F>,
+    streams: XReadGroupResultInner,
+) -> Result<()>
+where
+    F: Fn(JobPayload) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<()>> + Send,
+{
+    for (_stream, entries) in streams {
+        for (entry_id, field_map) in entries {
+            // Parse the payload.
+
+            if let Some(payload_str) = field_map.get("payload") {
+                match serde_json::from_str::<serde_json::Value>(payload_str) {
+                    Ok(json_val) => {
+                        let job_payload = JobPayload { data: json_val };
+
+                        // Call job handler.
+                        if let Err(e) = (params.handler)(job_payload).await {
+                            error!("Job failed: {e:?}");
+
+                            // May consider pushing to a dead-letter queue, etc., later?
+                            // For now, just XACK.
+
+                            xack_and_cleanup(params, &entry_id, None).await;
+                        } else {
+                            // If success, XACK
+                            xack_and_cleanup(params, &entry_id, None).await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Invalid JSON in payload: {e}");
+                        xack_and_cleanup(params, &entry_id, None).await;
+                    }
+                }
+            } else {
+                warn!("No payload field in entry {entry_id}");
+                xack_and_cleanup(params, &entry_id, None).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn xack_and_cleanup<F>(
+    params: &mut WorkerParams<'_, F>,
+    entry_id: &str,
+    dedup_key: Option<&str>,
+) {
+    let ack_res: redis::RedisResult<i64> = redis::cmd("XACK")
+        .arg(params.stream_key)
+        .arg(params.group_name)
+        .arg(entry_id)
+        .query_async(&mut *params.conn)
+        .await;
+    trace!("[{}] XACK {entry_id}: {:?}", params.consumer_name, ack_res);
+
+    if let Err(e) = ack_res {
+        error!("Failed XACK {entry_id}: {e}");
+    } else if let Some(dedup_key) = dedup_key {
+        let _: redis::RedisResult<i32> = redis::cmd("DEL")
+            .arg(dedup_key)
+            .query_async(&mut *params.conn)
+            .await;
     }
 }

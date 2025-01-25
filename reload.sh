@@ -1,5 +1,7 @@
 #!/bin/sh
+mkdir -p .redis-backup
+mkdir -p .redis
 docker compose down
-rm -rec -for .redis
-cp -rec .redis-backup .redis
+rm -rf .redis
+cp -r .redis-backup .redis
 docker compose up -d
