@@ -15,14 +15,14 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies
-RUN cargo build --release --features matrix_notifs
+RUN cargo build --release --features "matrix_notifs sentry_integration"
 RUN rm src/main.rs
 
 # Copy source code
 COPY . .
 
 # Build the application with all features
-RUN cargo build --release --features matrix_notifs
+RUN cargo build --release --features "matrix_notifs sentry_integration"
 
 # -----------------------------------------
 # Run stage
