@@ -89,9 +89,26 @@ impl ArticleSyncService {
         let payload = JobPayload {
             data: serde_json::json!({ "dictionary": dict.as_str() }),
         };
-        self.job_queue
+        if let Err(e) = self
+            .job_queue
             .enqueue(JobQueue::FetchArticleList, &payload)
             .await
+        {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to enqueue sync articles for dictionary {}: {}",
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchArticleList.to_stream_key()),
+                    Some(&payload.data),
+                )
+                .await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Fire off a job to do the dictionary metadata sync.
@@ -99,9 +116,26 @@ impl ArticleSyncService {
         let payload = JobPayload {
             data: serde_json::json!({ "dictionary": dict.as_str() }),
         };
-        self.job_queue
+        if let Err(e) = self
+            .job_queue
             .enqueue(JobQueue::FetchDictionaryMetadata, &payload)
             .await
+        {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to enqueue sync dictionary metadata for dictionary {}: {}",
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchDictionaryMetadata.to_stream_key()),
+                    Some(&payload.data),
+                )
+                .await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Fire off a job to fetch a single article.
@@ -119,15 +153,34 @@ impl ArticleSyncService {
                 "updatedAt": metadata.updated_at
             }
         });
-        self.job_queue
+        if let Err(e) = self
+            .job_queue
             .enqueue_dedup(
                 JobQueue::FetchArticle,
                 &dedup_key(dict, metadata.article_id),
-                &JobPayload { data: payload },
+                &JobPayload {
+                    data: payload.clone(),
+                },
                 6 * 60 * 60,
             )
             .await
-            .map(|_| ())
+        {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to enqueue sync article for article {} in dictionary {}: {}",
+                        metadata.article_id,
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchArticle.to_stream_key()),
+                    Some(&payload),
+                )
+                .await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Job handler for "FetchArticleList".
@@ -206,7 +259,7 @@ impl ArticleSyncService {
                 }
             }
 
-            // Build the JSON payload to be passed enqueue_sync_article further down
+            // Build the JSON payload to be passed to enqueue_sync_article further down
             let payload = serde_json::json!({
                 "dictionary": dict.as_str(),
                 "metadata": {
@@ -265,23 +318,37 @@ impl ArticleSyncService {
 
         // Perform a single pipelined batch enqueue
         if !payloads_to_enqueue.is_empty() {
-            self.job_queue
-                .enqueue_batch_dedup(
-                    JobQueue::FetchArticle,
-                    &payloads_to_enqueue
-                        .into_iter()
-                        .map(|p| {
-                            let article_id = p
-                                .get("metadata")
-                                .and_then(|m| m.get("articleId"))
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            (dedup_key(dict, article_id), p)
-                        })
-                        .collect::<Vec<_>>(),
-                    6 * 60 * 60,
-                )
-                .await?;
+            // Build payloads with dedup keys
+            let dedup_payloads: Vec<(String, Value)> = payloads_to_enqueue
+                .into_iter()
+                .map(|p| {
+                    let article_id = p
+                        .get("metadata")
+                        .and_then(|m| m.get("articleId"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    (dedup_key(dict, article_id), p)
+                })
+                .collect();
+            if let Err(e) = self
+                .job_queue
+                .enqueue_batch_dedup(JobQueue::FetchArticle, &dedup_payloads, 6 * 60 * 60)
+                .await
+            {
+                let _ = self
+                    .job_queue
+                    .log_error(
+                        &format!(
+                            "Failed to enqueue batch dedup for articles in dictionary {}: {}",
+                            dict.as_str(),
+                            e
+                        ),
+                        Some(JobQueue::FetchArticle.to_stream_key()),
+                        None,
+                    )
+                    .await;
+                return Err(e);
+            }
         }
 
         info!("[{:?}] Enqueued {} article fetch jobs", dict, total);
@@ -350,9 +417,25 @@ impl ArticleSyncService {
             dict, article_id, primary_lemma
         );
 
-        // Store in Redis
-        self.store_article(dict, article_id, &updated_article, &final_meta)
-            .await?;
+        if let Err(e) = self
+            .store_article(dict, article_id, &updated_article, &final_meta)
+            .await
+        {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to store article {} for dictionary {}: {}",
+                        article_id,
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchArticle.to_stream_key()),
+                    Some(&final_meta),
+                )
+                .await;
+            return Err(e);
+        }
 
         info!(
             "[{:?}] Article {} ({}) stored in Redis",
@@ -360,8 +443,25 @@ impl ArticleSyncService {
         );
 
         // Then queue related articles
-        self.queue_related_articles(dict, article_id, &updated_article)
-            .await?;
+        if let Err(e) = self
+            .queue_related_articles(dict, article_id, &updated_article)
+            .await
+        {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to queue related articles for article {} in dictionary {}: {}",
+                        article_id,
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchArticle.to_stream_key()),
+                    Some(&updated_article),
+                )
+                .await;
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -380,8 +480,7 @@ impl ArticleSyncService {
         let wc_key = format!("dictionary:{}:word_classes", dict.as_str());
         let wsc_key = format!("dictionary:{}:word_subclasses", dict.as_str());
 
-        // Use a pipelined batch to store all dictionary metadata
-        let _: () = redis::pipe()
+        let result: redis::RedisResult<()> = redis::pipe()
             .cmd("JSON.SET")
             .arg(&concept_key)
             .arg("$")
@@ -395,7 +494,22 @@ impl ArticleSyncService {
             .arg("$")
             .arg(serde_json::to_string(&word_subclasses)?)
             .query_async(conn)
-            .await?;
+            .await;
+        if let Err(e) = result {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to store dictionary metadata for {}: {}",
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchDictionaryMetadata.to_stream_key()),
+                    None,
+                )
+                .await;
+            return Err(e.into());
+        }
 
         info!("[{:?}] Dictionary metadata stored in Redis", dict);
         Ok(())
@@ -417,7 +531,21 @@ impl ArticleSyncService {
                     "[{:?}] No articles in DB, queueing initial article fetch.",
                     dict
                 );
-                self.enqueue_sync_articles(*dict).await?;
+                if let Err(e) = self.enqueue_sync_articles(*dict).await {
+                    let _ = self
+                        .job_queue
+                        .log_error(
+                            &format!(
+                                "Failed to enqueue initial sync articles for dictionary {}: {}",
+                                dict.as_str(),
+                                e
+                            ),
+                            Some(JobQueue::FetchArticleList.to_stream_key()),
+                            Some(&serde_json::json!({ "dictionary": dict.as_str() })),
+                        )
+                        .await;
+                    return Err(e);
+                }
 
                 let conn = &mut self.redis_client;
                 // Set a marker key to prevent re-queueing
@@ -433,7 +561,21 @@ impl ArticleSyncService {
             let concept_val: Option<String> = self.redis_client.json_get(&concept_key, "$").await?;
             if concept_val.is_none() {
                 warn!("[{:?}] Missing dictionary metadata, queueing fetch", dict);
-                self.enqueue_sync_dict_metadata(*dict).await?;
+                if let Err(e) = self.enqueue_sync_dict_metadata(*dict).await {
+                    let _ = self
+                        .job_queue
+                        .log_error(
+                            &format!(
+                                "Failed to enqueue dictionary metadata sync for dictionary {}: {}",
+                                dict.as_str(),
+                                e
+                            ),
+                            Some(JobQueue::FetchDictionaryMetadata.to_stream_key()),
+                            Some(&serde_json::json!({ "dictionary": dict.as_str() })),
+                        )
+                        .await;
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -533,7 +675,7 @@ impl ArticleSyncService {
         let article_json_str = serde_json::to_string(article_data)?;
         let meta_json_str = serde_json::to_string(meta)?;
 
-        let _: () = redis::pipe()
+        let result: redis::RedisResult<()> = redis::pipe()
             .cmd("JSON.SET")
             .arg(&article_key)
             .arg("$")
@@ -545,7 +687,23 @@ impl ArticleSyncService {
             .arg(&meta_json_str)
             .ignore()
             .query_async(conn)
-            .await?;
+            .await;
+        if let Err(e) = result {
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!(
+                        "Failed to store article {} for dictionary {}: {}",
+                        article_id,
+                        dict.as_str(),
+                        e
+                    ),
+                    Some(JobQueue::FetchArticle.to_stream_key()),
+                    Some(meta),
+                )
+                .await;
+            return Err(e.into());
+        }
 
         Ok(())
     }
@@ -678,8 +836,33 @@ impl ArticleSyncService {
                     revision: None,
                     updated_at: "".to_string(),
                 };
-                self.enqueue_sync_article(dict, &partial).await?;
-                enqueued_count += 1;
+                if let Err(e) = self.enqueue_sync_article(dict, &partial).await {
+                    let payload = serde_json::json!({
+                        "dictionary": dict.as_str(),
+                        "metadata": {
+                            "articleId": rid,
+                            "primaryLemma": "",
+                            "revision": null,
+                            "updatedAt": ""
+                        }
+                    });
+                    let _ = self
+                        .job_queue
+                        .log_error(
+                            &format!(
+                                "Failed to enqueue related article {} for dictionary {}: {}",
+                                rid,
+                                dict.as_str(),
+                                e
+                            ),
+                            Some(JobQueue::FetchArticle.to_stream_key()),
+                            Some(&payload),
+                        )
+                        .await;
+                    // Continue trying to queue the rest.
+                } else {
+                    enqueued_count += 1;
+                }
             }
         }
 

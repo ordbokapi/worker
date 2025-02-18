@@ -1,5 +1,3 @@
-// src/queue.rs
-
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use log::{debug, error, info, trace, warn};
@@ -227,7 +225,7 @@ impl JobQueueService {
     }
 
     /// Push multiple jobs (XADD) with deduplication via SETNX + TTL.
-    /// `payloads` is an array of `(payload_json, dedup_key)`.
+    /// `payloads` is an array of `(dedup_key, payload_json)`.
     /// We SET each key with NX + EX = `dedup_ttl_secs` and only XADD if
     /// the SET was successful. If the SET was not done, we skip enqueue.
     pub async fn enqueue_batch_dedup(
@@ -268,13 +266,13 @@ impl JobQueueService {
         let mut pipe_xadd = redis::pipe();
         let mut xadd_count = 0;
 
-        for (i, (_dedup_key, json_payload)) in payloads.iter().enumerate() {
+        for (i, (dedup_key, json_payload)) in payloads.iter().enumerate() {
             // If set_results[i] is Some("OK"), we can safely queue.
             if set_results[i].is_some() {
                 let payload_str = if let Value::Object(map) = json_payload {
                     // Add dedupKey to the XADD payload.
                     let mut json_payload = map.clone();
-                    json_payload.insert("dedupKey".to_string(), Value::String(_dedup_key.clone()));
+                    json_payload.insert("dedupKey".to_string(), Value::String(dedup_key.clone()));
                     serde_json::to_string(&json_payload)
                         .context("Failed to serialize job payload to JSON string")?
                 } else {
@@ -317,6 +315,43 @@ impl JobQueueService {
             payloads.len() - xadd_count
         );
 
+        Ok(())
+    }
+
+    /// Logs error information using Sentry if the `sentry_integration` feature is enabled.
+    /// When Sentry is not enabled, this is a no-op.
+    #[cfg(feature = "sentry_integration")]
+    pub async fn log_error(
+        &mut self,
+        error_info: &str,
+        queue: Option<&str>,
+        job_payload: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let mut extra = HashMap::new();
+        if let Some(q) = queue {
+            extra.insert("queue", serde_json::Value::String(q.to_string()));
+        }
+        if let Some(payload) = job_payload {
+            extra.insert("job_payload", payload.clone());
+        }
+        sentry::with_scope(
+            |scope| {
+                scope.set_extra("extra", serde_json::to_value(&extra).unwrap_or_default());
+            },
+            || sentry::capture_message(error_info, sentry::Level::Error),
+        );
+        Ok(())
+    }
+
+    /// Logs error information using Sentry if the `sentry_integration` feature is enabled.
+    /// When Sentry is not enabled, this is a no-op.
+    #[cfg(not(feature = "sentry_integration"))]
+    pub async fn log_error(
+        &mut self,
+        _error_info: &str,
+        _queue: Option<&str>,
+        _job_payload: Option<&serde_json::Value>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -444,11 +479,22 @@ where
             if let Some(payload_str) = field_map.get("payload") {
                 match serde_json::from_str::<serde_json::Value>(payload_str) {
                     Ok(json_val) => {
-                        let job_payload = JobPayload { data: json_val };
+                        let job_payload = JobPayload {
+                            data: json_val.clone(),
+                        };
 
                         // Call job handler.
                         if let Err(e) = (params.handler)(job_payload).await {
                             error!("Job failed: {e:?}");
+                            let error_msg =
+                                format!("Job processing error for entry {}: {:?}", entry_id, e);
+                            let _ = log_error(
+                                &mut *params.conn,
+                                &error_msg,
+                                Some(params.stream_key),
+                                Some(&json_val),
+                            )
+                            .await;
 
                             // May consider pushing to a dead-letter queue, etc., later?
                             // For now, just XACK.
@@ -461,6 +507,11 @@ where
                     }
                     Err(e) => {
                         error!("Invalid JSON in payload: {e}");
+                        let error_msg =
+                            format!("Invalid JSON payload for entry {}: {:?}", entry_id, e);
+                        let _ =
+                            log_error(&mut *params.conn, &error_msg, Some(params.stream_key), None)
+                                .await;
                         xack_and_cleanup(params, &entry_id, None).await;
                     }
                 }
@@ -494,4 +545,41 @@ async fn xack_and_cleanup<F>(
             .query_async(&mut *params.conn)
             .await;
     }
+}
+
+/// Logs error information using Sentry if the `sentry_integration` feature is enabled.
+/// When Sentry is not enabled, this is a no-op.
+#[cfg(feature = "sentry_integration")]
+async fn log_error(
+    _conn: &mut redis::aio::ConnectionManager,
+    error_info: &str,
+    queue: Option<&str>,
+    job_payload: Option<&serde_json::Value>,
+) -> Result<()> {
+    let mut extra = HashMap::new();
+    if let Some(q) = queue {
+        extra.insert("queue", serde_json::Value::String(q.to_string()));
+    }
+    if let Some(payload) = job_payload {
+        extra.insert("job_payload", payload.clone());
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_extra("extra", serde_json::to_value(&extra).unwrap_or_default());
+        },
+        || sentry::capture_message(error_info, sentry::Level::Error),
+    );
+    Ok(())
+}
+
+/// Logs error information using Sentry if the `sentry_integration` feature is enabled.
+/// When Sentry is not enabled, this is a no-op.
+#[cfg(not(feature = "sentry_integration"))]
+async fn log_error(
+    _conn: &mut redis::aio::ConnectionManager,
+    _error_info: &str,
+    _queue: Option<&str>,
+    _job_payload: Option<&serde_json::Value>,
+) -> Result<()> {
+    Ok(())
 }

@@ -1,5 +1,3 @@
-// src/migration.rs
-
 use anyhow::{anyhow, Result};
 use log::info;
 use redis::AsyncCommands;

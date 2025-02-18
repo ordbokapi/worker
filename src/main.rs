@@ -1,15 +1,17 @@
-// src/main.rs
-
 mod article_sync_service;
 #[cfg(feature = "matrix_notifs")]
 mod matrix_notify_service;
 mod migration;
 mod queue;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use clap::value_parser;
 use log::{error, info};
 use queue::get_dict_id;
+#[cfg(feature = "sentry_integration")]
+use sentry::integrations::anyhow::capture_anyhow;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 use crate::article_sync_service::{ArticleSyncService, UibDictionary};
@@ -18,8 +20,54 @@ use crate::matrix_notify_service::MatrixNotifyService;
 use crate::migration::MigrationService;
 use crate::queue::{JobPayload, JobQueue, JobQueueService};
 
+#[cfg(feature = "sentry_integration")]
+fn init_sentry() -> sentry::ClientInitGuard {
+    let dsn = std::env::var("SENTRY_ENDPOINT")
+        .expect("SENTRY_ENDPOINT must be set when using the sentry_integration feature.");
+    sentry::init((
+        dsn,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ))
+}
+
+#[derive(serde::Serialize)]
+struct ConsumerStatus {
+    consumer_name: String,
+    pending: i64,
+}
+
+#[derive(serde::Serialize)]
+struct PendingDetail {
+    message_id: String,
+    consumer: String,
+    idle_time_ms: i64,
+    delivery_count: i64,
+    job_payload: String,
+}
+
+#[derive(serde::Serialize)]
+struct QueueStatus {
+    queue: String,
+    stream_key: String,
+    total_messages: i64,
+    pending_total: i64,
+    min_id: String,
+    max_id: String,
+    consumer_stats: Vec<ConsumerStatus>,
+    pending_details: Vec<PendingDetail>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    #[cfg(feature = "dotenv")]
+    dotenv::dotenv().ok();
+
+    #[cfg(feature = "sentry_integration")]
+    let _sentry_guard = init_sentry();
+
     // Used to notify Matrix when events occur.
     #[cfg(feature = "matrix_notifs")]
     let mut matrix_service_opt = None;
@@ -28,9 +76,6 @@ async fn main() -> Result<()> {
     async fn run(
         #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<MatrixNotifyService>,
     ) -> Result<()> {
-        #[cfg(feature = "dotenv")]
-        dotenv::dotenv().ok();
-
         let matches = clap::Command::new("Ordbok API Worker")
             .version(env!("CARGO_PKG_VERSION"))
             .author("Adaline Simonian <adalinesimonian@gmail.com>")
@@ -42,6 +87,7 @@ async fn main() -> Result<()> {
                     .short('l')
                     .value_name("LEVEL")
                     .help("Set the log level. If the log level is set by the RUST_LOG environment variable, this flag will be ignored.")
+                    .global(true)
                     .default_value("info"),
             )
             .subcommand(
@@ -58,18 +104,48 @@ async fn main() -> Result<()> {
                     ),
             )
             .subcommand(
-                clap::Command::new("flush-queues")
-                    .about("Flush all queues")
-                    .long_about("Flush all queues, removing all pending jobs.")
-                    .after_long_help("This is a destructive operation and cannot be undone. If you have flushed all queues and the dictionaries are not in sync, you will need to either resync the dictionaries manually or wait for the next scheduled sync.")
-                    .visible_alias("flushqueues")
-                    .arg(
-                        clap::Arg::new("yes")
-                            .long("yes")
-                            .short('y')
-                            .help("Skip the confirmation prompt and flush all queues immediately.")
-                            .action(clap::ArgAction::SetTrue),
-                    ),
+                clap::Command::new("queues")
+                    .about("Queue operations")
+                    .subcommand(
+                        clap::Command::new("flush")
+                            .long_about("Flush all queues, removing all pending jobs.")
+                            .after_long_help("This is a destructive operation and cannot be undone. If you have flushed all queues and the dictionaries are not in sync, you will need to either resync the dictionaries manually or wait for the next scheduled sync.")
+                            .visible_alias("flushqueues")
+                            .arg(
+                                clap::Arg::new("yes")
+                                    .long("yes")
+                                    .short('y')
+                                    .help("Skip the confirmation prompt and flush all queues immediately.")
+                                    .action(clap::ArgAction::SetTrue),
+                            ),
+                    )
+                    .subcommand(
+                        clap::Command::new("status")
+                            .about("Display the status of the job queues")
+                            .arg(
+                                clap::Arg::new("output")
+                                    .long("output")
+                                    .short('o')
+                                    .value_name("FORMAT")
+                                    .help("Output format: text or json")
+                                    .default_value("text")
+                                    .value_parser(["text", "json"]),
+                            ),
+                    )
+                    .subcommand(
+                        clap::Command::new("resync")
+                            .about("Queue a resync of all dictionaries without running them immediately")
+                            .after_long_help("This command queues resync tasks for dictionaries and then exits.")
+                            .arg(
+                                clap::Arg::new("dictionary")
+                                    .long("dictionary")
+                                    .short('d')
+                                    .value_name("DICTIONARY")
+                                    .help("Dictionary to resync. If omitted, all dictionaries will be queued for resync. Can be specified multiple times.")
+                                    .value_parser(value_parser!(UibDictionary))
+                                    .action(clap::ArgAction::Append),
+                            ),
+                    )
             )
             .get_matches();
 
@@ -81,28 +157,110 @@ async fn main() -> Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
             .init();
 
-        let flush_queues = if let Some("flush-queues") = matches.subcommand_name() {
-            let subcmd = matches.subcommand_matches("flush-queues").unwrap();
-            if !subcmd.get_flag("yes") {
-                eprintln!("Flushing all queues is a destructive operation and cannot be undone. Are you sure you want to continue? (y/N)");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim().to_lowercase() == "y" {
-                    true
-                } else {
-                    eprintln!("Received input other than 'y', exiting.");
+        // Handle the queues subcommand branch.
+        if let Some(("queues", queues_sub)) = matches.subcommand() {
+            match queues_sub.subcommand() {
+                Some(("flush", subcmd)) => {
+                    if !subcmd.get_flag("yes") {
+                        eprintln!("Flushing all queues is a destructive operation and cannot be undone. Are you sure you want to continue? (y/N)");
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        if input.trim().to_lowercase() != "y" {
+                            eprintln!("Received input other than 'y', exiting.");
+                            return Ok(());
+                        }
+                    } else {
+                        eprintln!("--yes/-y passed to flush, skipping confirmation prompt.");
+                    };
+
+                    eprintln!("Flushing all queues…");
+                    // Connect to Redis.
+                    let redis_url = std::env::var("REDIS_URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+                    let redis_client = redis::Client::open(redis_url.clone())?;
+                    let conn_info = redis_client.get_connection_info();
+
+                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
+
+                    let mut job_queue = JobQueueService {
+                        redis_client: redis_client.clone(),
+                        redis_connection_manager: redis_client.get_connection_manager().await?,
+                    };
+                    job_queue.setup_consumer_groups(true).await?;
+                    eprintln!("All queues have been flushed.");
                     return Ok(());
                 }
-            } else {
-                eprintln!("--yes/-y passed to flush-queues, skipping confirmation prompt.");
-                true
-            }
-        } else {
-            false
-        };
+                Some(("status", subcmd)) => {
+                    let output_format = subcmd
+                        .get_one::<String>("output")
+                        .map(String::as_str)
+                        .unwrap_or("text");
+                    let redis_url = std::env::var("REDIS_URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+                    let redis_client = redis::Client::open(redis_url.clone())?;
+                    let conn_info = redis_client.get_connection_info();
 
-        if flush_queues {
-            info!("Flushing all queues…");
+                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
+
+                    handle_queue_status(&redis_client, output_format).await?;
+                    return Ok(());
+                }
+                Some(("resync", subcmd)) => {
+                    let redis_url = std::env::var("REDIS_URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+                    let redis_client = redis::Client::open(redis_url.clone())?;
+                    let conn_info = redis_client.get_connection_info();
+                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
+
+                    // Create separate connection managers for queues and data.
+                    let redis_connection_manager_queues =
+                        redis_client.get_connection_manager().await?;
+                    let redis_connection_manager_data =
+                        redis_client.get_connection_manager().await?;
+                    let mut job_queue = JobQueueService {
+                        redis_client: redis_client.clone(),
+                        redis_connection_manager: redis_connection_manager_queues.clone(),
+                    };
+                    job_queue.setup_consumer_groups(false).await?;
+
+                    #[cfg(feature = "matrix_notifs")]
+                    let matrix_service = MatrixNotifyService::new(job_queue.clone()).await;
+
+                    let mut sync_service = ArticleSyncService {
+                        redis_client: redis_connection_manager_data.clone(),
+                        job_queue: job_queue.clone(),
+                        #[cfg(feature = "matrix_notifs")]
+                        matrix_service,
+                    };
+
+                    let dicts = subcmd
+                        .get_many::<UibDictionary>("dictionary")
+                        .unwrap_or_default()
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    let dicts = if dicts.is_empty() {
+                        eprintln!("Queueing resync for all dictionaries.");
+                        UibDictionary::all().to_vec()
+                    } else {
+                        eprintln!("Queueing resync for dictionaries: {:?}", dicts);
+                        dicts
+                    };
+
+                    for d in dicts {
+                        eprintln!("Queueing resync tasks for dictionary {:?}…", d);
+                        if let Err(e) = sync_service.enqueue_sync_articles(d).await {
+                            eprintln!("enqueue_sync_articles error: {e}");
+                        }
+                        if let Err(e) = sync_service.enqueue_sync_dict_metadata(d).await {
+                            eprintln!("enqueue_sync_dict_metadata error: {e}");
+                        }
+                    }
+                    eprintln!("Resync tasks have been queued. Exiting.");
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         let resync_dictionaries = if let Some("resync") = matches.subcommand_name() {
@@ -154,12 +312,7 @@ async fn main() -> Result<()> {
             redis_client: redis_client.clone(),
             redis_connection_manager: redis_connection_manager_queues.clone(),
         };
-        job_queue.setup_consumer_groups(flush_queues).await?;
-
-        if flush_queues {
-            info!("All queues have been flushed.");
-            return Ok(());
-        }
+        job_queue.setup_consumer_groups(false).await?;
 
         // Initialize MatrixNotifyService
         #[cfg(feature = "matrix_notifs")]
@@ -337,6 +490,11 @@ async fn main() -> Result<()> {
     {
         error!("Application error: {err}");
 
+        #[cfg(feature = "sentry_integration")]
+        {
+            capture_anyhow(&err);
+        }
+
         // If MatrixNotifyService is available, send an alert
         #[cfg(feature = "matrix_notifs")]
         {
@@ -350,6 +508,189 @@ async fn main() -> Result<()> {
         }
 
         return Err(err);
+    }
+    Ok(())
+}
+
+async fn handle_queue_status(redis_client: &redis::Client, output_format: &str) -> Result<()> {
+    let conn = redis_client.get_connection_manager().await?;
+
+    // List of queues. MatrixNotify is added only if the feature is enabled.
+    let queues = vec![
+        crate::queue::JobQueue::FetchArticleList,
+        crate::queue::JobQueue::FetchArticle,
+        crate::queue::JobQueue::FetchDictionaryMetadata,
+        #[cfg(feature = "matrix_notifs")]
+        crate::queue::JobQueue::MatrixNotify,
+    ];
+
+    const EXTENDED_LIMIT: usize = 10;
+
+    // Helper function to retrieve and pretty-print a job's payload.
+    async fn get_job_payload(
+        conn: &mut redis::aio::ConnectionManager,
+        stream_key: &str,
+        message_id: &str,
+    ) -> String {
+        let range: Vec<(String, HashMap<String, String>)> = redis::cmd("XRANGE")
+            .arg(stream_key)
+            .arg(message_id)
+            .arg(message_id)
+            .query_async(conn)
+            .await
+            .unwrap_or_default();
+
+        range
+            .first()
+            .and_then(|(_id, fields)| fields.get("payload"))
+            .and_then(|payload_str| serde_json::from_str::<serde_json::Value>(payload_str).ok())
+            .map(|json_val| {
+                serde_json::to_string_pretty(&json_val)
+                    .unwrap_or_else(|_| "Could not parse job payload.".to_string())
+            })
+            .unwrap_or_else(|| "Could not parse job payload.".to_string())
+    }
+
+    // Helper function to pretty-print a duration in milliseconds, from a number of
+    // milliseconds into a string like "6d 01:49:39.13".
+    fn format_duration(ms: i64) -> String {
+        let total_seconds = ms as f64 / 1000.0;
+        let days = (total_seconds / 86400.0).floor() as i64;
+        let rem_after_days = total_seconds - (days as f64 * 86400.0);
+        let hours = (rem_after_days / 3600.0).floor() as i64;
+        let rem_after_hours = rem_after_days - (hours as f64 * 3600.0);
+        let minutes = (rem_after_hours / 60.0).floor() as i64;
+        let seconds = rem_after_hours - (minutes as f64 * 60.0);
+        if days > 0 {
+            format!("{}d {:02}:{:02}:{:05.2}", days, hours, minutes, seconds)
+        } else {
+            format!("{:02}:{:02}:{:05.2}", hours, minutes, seconds)
+        }
+    }
+
+    // Process all queues concurrently.
+    let statuses = futures::future::join_all(queues.into_iter().map(|q| {
+        // Clone the connection manager for each concurrent task.
+        let mut conn = conn.clone();
+        async move {
+            let stream_key = q.to_stream_key();
+            let group_name = q.to_group_name();
+
+            // Retrieve XPENDING summary.
+            let xp_summary: (i64, String, String, Vec<(String, i64)>) = redis::cmd("XPENDING")
+                .arg(stream_key)
+                .arg(group_name)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or((0, "-".to_string(), "-".to_string(), vec![]));
+            let (pending_total, min_id, max_id, consumer_stats_raw) = xp_summary;
+            let consumer_stats = consumer_stats_raw
+                .into_iter()
+                .map(|(name, pending)| ConsumerStatus {
+                    consumer_name: name,
+                    pending,
+                })
+                .collect::<Vec<_>>();
+
+            // Retrieve extended pending details.
+            let extended_details_raw: Vec<(String, String, i64, i64)> = redis::cmd("XPENDING")
+                .arg(stream_key)
+                .arg(group_name)
+                .arg("-")
+                .arg("+")
+                .arg(EXTENDED_LIMIT)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or_default();
+
+            // For each pending message, fetch its job payload.
+            let mut pending_details = Vec::with_capacity(extended_details_raw.len());
+            for (message_id, consumer, idle_time_ms, delivery_count) in extended_details_raw {
+                let job_payload = get_job_payload(&mut conn, stream_key, &message_id).await;
+                pending_details.push(PendingDetail {
+                    message_id,
+                    consumer,
+                    idle_time_ms,
+                    delivery_count,
+                    job_payload,
+                });
+            }
+
+            // Retrieve total messages in the stream.
+            let total_messages: i64 = redis::cmd("XLEN")
+                .arg(stream_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(0);
+
+            QueueStatus {
+                queue: format!("{:?}", q),
+                stream_key: stream_key.to_owned(),
+                total_messages,
+                pending_total,
+                min_id,
+                max_id,
+                consumer_stats,
+                pending_details,
+            }
+        }
+    }))
+    .await;
+
+    // Output the result.
+
+    if output_format == "json" {
+        println!("{}", serde_json::to_string_pretty(&statuses)?);
+        return Ok(());
+    }
+
+    for status in statuses {
+        println!("Queue: {}", status.queue);
+        println!("  Stream key: {}", status.stream_key);
+        println!("  Total messages: {}", status.total_messages);
+        println!(
+            "  Pending messages: {} (min: {}, max: {})",
+            status.pending_total, status.min_id, status.max_id
+        );
+        println!("  Consumer stats:");
+        if status.consumer_stats.is_empty() {
+            println!("    (none)");
+        } else {
+            for consumer in &status.consumer_stats {
+                println!(
+                    "    {}: {} pending",
+                    consumer.consumer_name, consumer.pending
+                );
+            }
+        }
+        println!("  Pending job details (up to {}):", EXTENDED_LIMIT);
+        if status.pending_details.is_empty() {
+            println!("    (none)");
+        } else {
+            for detail in &status.pending_details {
+                let formatted_idle = format_duration(detail.idle_time_ms);
+                println!(
+                    "    Message {}: consumer '{}', idle {}, delivered {} times",
+                    detail.message_id, detail.consumer, formatted_idle, detail.delivery_count
+                );
+                println!("      Payload:");
+
+                // Remove outer braces and indent inner lines.
+                if detail.job_payload.starts_with('{') && detail.job_payload.ends_with('}') {
+                    let lines: Vec<&str> = detail.job_payload.lines().collect();
+                    if lines.len() > 2 {
+                        for line in &lines[1..lines.len() - 1] {
+                            println!("        {}", line.trim());
+                        }
+
+                        continue;
+                    }
+                }
+
+                println!("        {}", detail.job_payload);
+            }
+        }
+        println!();
     }
 
     Ok(())

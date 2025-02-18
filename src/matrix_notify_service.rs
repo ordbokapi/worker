@@ -91,6 +91,14 @@ impl MatrixNotifyService {
             let content = RoomMessageEventContent::text_markdown(msg);
             if room.send(content).await.is_err() {
                 error!("Error sending message: '{msg}'");
+                let _ = self
+                    .job_queue
+                    .log_error(
+                        &format!("Error sending Matrix message: {}", msg),
+                        Some(JobQueue::MatrixNotify.to_stream_key()),
+                        Some(&serde_json::json!({ "msg": msg })),
+                    )
+                    .await;
             } else {
                 self.last_send = Instant::now();
             }
@@ -102,11 +110,24 @@ impl MatrixNotifyService {
         let payload = serde_json::json!({ "msg": msg });
         if self
             .job_queue
-            .enqueue(JobQueue::MatrixNotify, &JobPayload { data: payload })
+            .enqueue(
+                JobQueue::MatrixNotify,
+                &JobPayload {
+                    data: payload.clone(),
+                },
+            )
             .await
             .is_err()
         {
             error!("Error queueing message: '{msg}'");
+            let _ = self
+                .job_queue
+                .log_error(
+                    &format!("Error queueing Matrix message: {}", msg),
+                    Some(JobQueue::MatrixNotify.to_stream_key()),
+                    Some(&payload),
+                )
+                .await;
         }
     }
 }

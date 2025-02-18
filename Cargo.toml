@@ -5,14 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
-clap = { version = "4.5.27", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.30", features = ["derive", "wrap_help"] }
 futures = "0.3.31"
-indicatif = "0.17.9"
+indicatif = "0.17.11"
 num_cpus = "1.16.0"
-redis = { version = "0.28.2", features = ["tokio-comp", "aio", "connection-manager", "tokio-native-tls-comp", "json"] }
+redis = { version = "0.29.0", features = ["tokio-comp", "aio", "connection-manager", "tokio-native-tls-comp", "json"] }
 reqwest = { version = "0.12.12", features = ["json"] }
 serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.137"
+serde_json = "1.0.138"
 tokio = { version = "1.43.0", features = ["fs", "rt-multi-thread", "macros"] }
 tokio-macros = "2.5.0"
 tokio-native-tls = "0.3.1"
@@ -20,13 +20,15 @@ tokio-cron-scheduler = "0.13.0"
 log = "0.4.25"
 env_logger = "0.11.6"
 dotenv = { version = "0.15.0", optional = true }
-matrix-sdk = { version = "0.9.0", optional = true, default-features = false, features = ["native-tls", "markdown"] }
-pulldown-cmark = { version = "0.12.2", optional = true }
+matrix-sdk = { version = "0.10.0", optional = true, default-features = false, features = ["native-tls", "markdown"] }
+pulldown-cmark = { version = "0.13.0", optional = true }
+sentry = { version = "0.36.0", optional = true, features = ["anyhow"] }
 
 [features]
 default = []
 use_dotenv = ["dotenv"]
 matrix_notifs = ["matrix-sdk", "pulldown-cmark"]
+sentry_integration = ["sentry"]
 
 [profile.dev]
 debug = true
