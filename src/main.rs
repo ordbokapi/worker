@@ -413,7 +413,7 @@ async fn main() -> Result<()> {
             info!("Starting worker group for FetchArticleList…");
             let svc = sync_service.clone();
             job_queue
-                .start_worker_group(JobQueue::FetchArticleList, 3, 1, move |job: JobPayload| {
+                .start_worker_group(JobQueue::FetchArticleList, 1, 1, move |job: JobPayload| {
                     let mut svc2 = svc.clone();
                     async move {
                         let dict = match get_dict_id(&job) {

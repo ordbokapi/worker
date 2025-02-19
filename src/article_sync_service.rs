@@ -186,7 +186,7 @@ impl ArticleSyncService {
     /// Job handler for "FetchArticleList".
     pub async fn handle_sync_articles(&mut self, dict: UibDictionary) -> Result<()> {
         info!("[{:?}] Fetching article list from UiB API", dict);
-        let article_list = self.fetch_article_list_from_uib(dict).await?;
+        let mut article_list = self.fetch_article_list_from_uib(dict).await?;
         info!(
             "[{:?}] {} articles returned from UiB",
             dict,
@@ -211,8 +211,12 @@ impl ArticleSyncService {
             missing_articles: 0,
         };
 
-        for raw_meta in article_list.iter() {
+        let mut new_id_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        for raw_meta in article_list.drain(..) {
             let meta = self.convert_raw_article_metadata(raw_meta)?;
+
+            new_id_set.insert(meta.article_id);
 
             // Check if existing metadata exists, and if so, matches the fetched metadata
             if let Some(existing) = existing_metadata_map.get(&meta.article_id) {
@@ -274,11 +278,6 @@ impl ArticleSyncService {
 
         // Detect articles no longer in UiB's new list. We should manually check these
         // by fetching since they may possibly still exist if fetched directly.
-        let new_id_set: std::collections::HashSet<i64> = article_list
-            .iter()
-            .filter_map(|raw| raw.get(0))
-            .filter_map(|v| v.as_i64())
-            .collect();
         let mut missing_count = 0;
         for (existing_id, ex_meta) in existing_metadata_map {
             if !new_id_set.contains(&existing_id) {
@@ -631,7 +630,7 @@ impl ArticleSyncService {
     }
 
     /// Convert raw article metadata to a struct.
-    fn convert_raw_article_metadata(&self, raw: &Value) -> Result<ArticleMetadata> {
+    fn convert_raw_article_metadata(&self, raw: Value) -> Result<ArticleMetadata> {
         // raw is e.g. [articleId, primaryLemma, revision, updatedAt]
         let arr = raw
             .as_array()
@@ -715,9 +714,9 @@ impl ArticleSyncService {
     ) -> Result<HashMap<i64, ArticleMetadata>> {
         let hash_key = format!("dictionary:{}:articles", dict.as_str());
         let conn = &mut self.redis_client;
-        let vals: HashMap<String, String> = conn.hgetall(&hash_key).await?;
+        let mut vals: HashMap<String, String> = conn.hgetall(&hash_key).await?;
         let mut map = HashMap::new();
-        for (article_id_str, meta_json_str) in vals {
+        for (article_id_str, meta_json_str) in vals.drain() {
             if let Ok(article_id) = article_id_str.parse::<i64>() {
                 if let Ok(v) = serde_json::from_str::<Value>(&meta_json_str) {
                     let article_id = v
