@@ -902,3 +902,44 @@ impl ArticleSyncService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::article_sync_service::{dedup_key, UibDictionary};
+
+    #[test]
+    fn test_uib_dictionary_as_str() {
+        assert_eq!(UibDictionary::Bokmål.as_str(), "bm");
+        assert_eq!(UibDictionary::Nynorsk.as_str(), "nn");
+        assert_eq!(UibDictionary::NorskOrdbok.as_str(), "no");
+    }
+
+    #[test]
+    fn test_uib_dictionary_all() {
+        let all = UibDictionary::all();
+        assert_eq!(
+            all,
+            &[
+                UibDictionary::Bokmål,
+                UibDictionary::Nynorsk,
+                UibDictionary::NorskOrdbok
+            ]
+        );
+    }
+
+    #[test]
+    fn test_uib_dictionary_from_str() {
+        assert_eq!(
+            UibDictionary::from_str("bm", false).unwrap(),
+            UibDictionary::Bokmål
+        );
+        assert!(UibDictionary::from_str("dk", false).is_err());
+    }
+
+    #[test]
+    fn test_dedup_key() {
+        let key = dedup_key(UibDictionary::Nynorsk, 42);
+        assert_eq!(key, "lock:article:nn:42");
+    }
+}

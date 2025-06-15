@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::value_parser;
-use log::{error, info};
+use log::{error, info, warn};
 use queue::get_dict_id;
 #[cfg(feature = "sentry_integration")]
 use sentry::integrations::anyhow::capture_anyhow;
@@ -21,16 +21,23 @@ use crate::migration::MigrationService;
 use crate::queue::{JobPayload, JobQueue, JobQueueService};
 
 #[cfg(feature = "sentry_integration")]
-fn init_sentry() -> sentry::ClientInitGuard {
-    let dsn = std::env::var("SENTRY_ENDPOINT")
-        .expect("SENTRY_ENDPOINT must be set when using the sentry_integration feature.");
-    sentry::init((
-        dsn,
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            ..Default::default()
-        },
-    ))
+fn init_sentry() -> Option<sentry::ClientInitGuard> {
+    match std::env::var("SENTRY_ENDPOINT") {
+        Ok(dsn) => {
+            let guard = sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    ..Default::default()
+                },
+            ));
+            Some(guard)
+        }
+        Err(_) => {
+            warn!("SENTRY_ENDPOINT not set; skipping sentry initialization.");
+            None
+        }
+    }
 }
 
 #[derive(serde::Serialize)]

@@ -261,3 +261,18 @@ impl MigrationService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_versions() {
+        let versions = get_versions();
+        assert!(versions.len() >= 2);
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[1].version, 2);
+        assert!(!versions[0].migrations.is_empty());
+        assert!(!versions[1].migrations.is_empty());
+    }
+}

@@ -1,4 +1,4 @@
-name: Main Branch
+name: Test
 
 on:
   push:
@@ -9,6 +9,18 @@ on:
       - "docker-compose.yml"
       - "*.ps1"
       - "*.sh"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - "docker-compose.yml"
+      - "*.ps1"
+      - "*.sh"
+
+concurrency:
+  group: ${{ github.event_name }}-${{ github.event.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
@@ -43,6 +55,5 @@ jobs:
             -D clippy::perf -D clippy::dbg_macro -D clippy::todo \
             -D clippy::unimplemented -D warnings
 
-      # - name: Test
-      #   if: always() && (matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu') || (matrix.os == 'windows-latest' && matrix.target == 'x86_64-pc-windows-msvc') || (matrix.os == 'macos-latest' && matrix.target == 'x86_64-apple-darwin')
-      #   run: cargo test --release --target ${{ matrix.target }}
+      - name: Run tests
+        run: cargo test --release --all-features --target ${{ matrix.target }}

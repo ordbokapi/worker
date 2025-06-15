@@ -583,3 +583,65 @@ async fn log_error(
 ) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::article_sync_service::UibDictionary;
+    use serde_json::json;
+
+    #[test]
+    fn test_job_queue_stream_key() {
+        assert_eq!(
+            JobQueue::FetchArticleList.to_stream_key(),
+            "stream:fetch-article-list"
+        );
+        assert_eq!(
+            JobQueue::FetchArticle.to_stream_key(),
+            "stream:fetch-article"
+        );
+        assert_eq!(
+            JobQueue::FetchDictionaryMetadata.to_stream_key(),
+            "stream:fetch-dict-metadata"
+        );
+    }
+
+    #[test]
+    fn test_job_queue_group_name() {
+        assert_eq!(
+            JobQueue::FetchArticleList.to_group_name(),
+            "group:fetch-article-list"
+        );
+        assert_eq!(
+            JobQueue::FetchArticle.to_group_name(),
+            "group:fetch-article"
+        );
+        assert_eq!(
+            JobQueue::FetchDictionaryMetadata.to_group_name(),
+            "group:fetch-dict-metadata"
+        );
+    }
+
+    #[test]
+    fn test_get_dict_id_success() {
+        let payload = JobPayload {
+            data: json!({"dictionary": "bm"}),
+        };
+        let dict = get_dict_id(&payload).unwrap();
+        assert_eq!(dict, UibDictionary::Bokmål);
+    }
+
+    #[test]
+    fn test_get_dict_id_invalid() {
+        let payload = JobPayload {
+            data: json!({"dictionary": "xx"}),
+        };
+        assert!(get_dict_id(&payload).is_err());
+    }
+
+    #[test]
+    fn test_get_dict_id_missing() {
+        let payload = JobPayload { data: json!({}) };
+        assert!(get_dict_id(&payload).is_err());
+    }
+}
