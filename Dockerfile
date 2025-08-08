@@ -1,7 +1,7 @@
 # -----------------------------------------
 # Build stage
 # -----------------------------------------
-FROM rust:1.87 AS builder
+FROM rust:1.89 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y libssl-dev pkg-config openssh-client && rm -rf /var/lib/apt/lists/*
