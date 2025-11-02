@@ -6,6 +6,10 @@
       "matchUpdateTypes": ["minor", "patch"],
       "matchCurrentVersion": "!/^0/",
       "automerge": true
+    },
+    {
+      "matchFiles": ["Cargo.toml"],
+      "rangeStrategy": "bump"
     }
   ]
 }
