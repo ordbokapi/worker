@@ -20,7 +20,7 @@ tokio-cron-scheduler = "0.15.1"
 log = "0.4.25"
 env_logger = "0.11.6"
 dotenv = { version = "0.15.0", optional = true }
-matrix-sdk = { version = "0.12.0", optional = true, default-features = false, features = ["native-tls", "markdown"] }
+matrix-sdk = { version = "0.14.0", optional = true, default-features = false, features = ["native-tls", "markdown"] }
 pulldown-cmark = { version = "0.13.0", optional = true }
 sentry = { version = "0.39.0", optional = true, features = ["anyhow"] }
 
