@@ -8,7 +8,7 @@
       "automerge": true
     },
     {
-      "matchFiles": ["Cargo.toml"],
+      "matchFileNames": ["Cargo.toml"],
       "rangeStrategy": "bump"
     }
   ]
