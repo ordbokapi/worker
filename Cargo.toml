@@ -34,5 +34,5 @@ sentry_integration = ["sentry"]
 debug = true
 
 [dev-dependencies]
-assert_cmd = "2.0"
+assert_cmd = "2.1.1"
 predicates = "3.1.3"

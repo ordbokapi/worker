@@ -1,11 +1,11 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 
 // Integration tests to ensure main binary runs and prints help.
 
 #[test]
 fn test_help() {
-    let mut cmd = Command::cargo_bin("ordbokapi-worker").unwrap();
+    let mut cmd = cargo_bin_cmd!("ordbokapi-worker");
     cmd.arg("--help");
     cmd.assert()
         .success()
