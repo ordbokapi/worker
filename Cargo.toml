@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0.100"
 clap = { version = "4.5.52", features = ["derive", "wrap_help"] }
 futures = "0.3.31"
-indicatif = "0.18.2"
+indicatif = "0.18.3"
 num_cpus = "1.17.0"
 redis = { version = "0.32.7", features = ["tokio-comp", "aio", "connection-manager", "tokio-native-tls-comp", "json"] }
 reqwest = { version = "0.12.24", features = ["json"] }
