@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.101"
-clap = { version = "4.5.57", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.58", features = ["derive", "wrap_help"] }
 futures = "0.3.31"
 indicatif = "0.18.3"
 num_cpus = "1.17.0"
