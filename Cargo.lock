@@ -286,15 +286,24 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.7.1"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "archery"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eae2ed21cd55021f05707a807a5fc85695dafb98832921f6cfa06db67ca5b869"
+
+[[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "arrayref"
@@ -361,6 +370,17 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "async-lock"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -2898,11 +2918,13 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "0.32.7"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "014cc767fefab6a3e798ca45112bccad9c6e0e218fbd49720042716c73cfef44"
+checksum = "f44e94c96d8870a387d88ce3de3fdd608cbfc0705f03cb343cdde91509d3e49a"
 dependencies = [
  "arc-swap",
+ "arcstr",
+ "async-lock",
  "backon",
  "bytes",
  "cfg-if",
@@ -2923,6 +2945,7 @@ dependencies = [
  "tokio-native-tls",
  "tokio-util",
  "url",
+ "xxhash-rust",
 ]
 
 [[package]]
