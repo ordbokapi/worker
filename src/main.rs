@@ -1,24 +1,88 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Adaline Simonian
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// This file is part of Ordbok API.
+//
+// Ordbok API is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option) any
+// later version.
+//
+// Ordbok API is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+// details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
+
 mod article_sync_service;
 #[cfg(feature = "matrix_notifs")]
 mod matrix_notify_service;
-mod migration;
-mod queue;
+mod meili;
 
-use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
+use apalis::prelude::*;
+use apalis_board::axum::{
+    framework::{ApiBuilder, RegisterRoute},
+    ui::ServeUI,
+};
+use apalis_cron::CronStream;
+use apalis_redis::{ConnectionManager, RedisConfig, RedisStorage};
+use axum::Router;
 use clap::value_parser;
-use log::{error, info, warn};
-use queue::get_dict_id;
+use cron::Schedule;
+use meilisearch_sdk::client::Client as MeiliClient;
+use serde::{Serialize, de::DeserializeOwned};
+use sqlx::postgres::PgPoolOptions;
+use tracing::{error, info, warn};
+
+use crate::article_sync_service::{
+    ArticleSyncService, FetchArticleJob, FetchArticleListJob, FetchDictionaryMetadataJob,
+    UibDictionary,
+};
+
+#[cfg(feature = "matrix_notifs")]
+use crate::article_sync_service::SendMatrixMessageJob;
+
+#[derive(Default, Clone)]
+struct JobTracker {
+    inner: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl JobTracker {
+    fn track(&self, description: String) -> JobGuard {
+        self.inner.lock().unwrap().push(description.clone());
+        JobGuard {
+            tracker: self.clone(),
+            description,
+        }
+    }
+
+    fn active_jobs(&self) -> Vec<String> {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
+struct JobGuard {
+    tracker: JobTracker,
+    description: String,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        let mut jobs = self.tracker.inner.lock().unwrap();
+        if let Some(pos) = jobs.iter().position(|j| j == &self.description) {
+            jobs.swap_remove(pos);
+        }
+    }
+}
+
 #[cfg(feature = "sentry_integration")]
 use sentry::integrations::anyhow::capture_anyhow;
-use tokio_cron_scheduler::{Job, JobScheduler};
-
-use crate::article_sync_service::{ArticleSyncService, UibDictionary};
-#[cfg(feature = "matrix_notifs")]
-use crate::matrix_notify_service::MatrixNotifyService;
-use crate::migration::MigrationService;
-use crate::queue::{JobPayload, JobQueue, JobQueueService};
 
 #[cfg(feature = "sentry_integration")]
 fn init_sentry() -> Option<sentry::ClientInitGuard> {
@@ -27,6 +91,7 @@ fn init_sentry() -> Option<sentry::ClientInitGuard> {
             let guard = sentry::init((
                 dsn,
                 sentry::ClientOptions {
+                    environment: std::env::var("ENVIRONMENT").ok().map(Into::into),
                     release: sentry::release_name!(),
                     ..Default::default()
                 },
@@ -40,48 +105,67 @@ fn init_sentry() -> Option<sentry::ClientInitGuard> {
     }
 }
 
-#[derive(serde::Serialize)]
-struct ConsumerStatus {
-    consumer_name: String,
-    pending: i64,
+/// Create a RedisStorage with the given namespace.
+fn redis_storage<T>(conn: &ConnectionManager, namespace: &str) -> RedisStorage<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    RedisStorage::new_with_config(
+        conn.clone(),
+        RedisConfig::default().set_namespace(namespace),
+    )
 }
 
-#[derive(serde::Serialize)]
-struct PendingDetail {
-    message_id: String,
-    consumer: String,
-    idle_time_ms: i64,
-    delivery_count: i64,
-    job_payload: String,
+/// Register one or more workers with the monitor.
+macro_rules! register_workers {
+    ($monitor:expr, $svc:expr, $tracker:expr, $($name:literal => $backend:expr, $concurrency:expr, $handler:expr);+ $(;)?) => {{
+        let monitor = $monitor;
+        $(
+            let s = $svc.clone();
+            let t = $tracker.clone();
+            let b = $backend;
+            let monitor = monitor.register(move |_| {
+                WorkerBuilder::new($name)
+                    .backend(b.clone())
+                    .concurrency($concurrency)
+                    .data(s.clone())
+                    .data(t.clone())
+                    .build($handler)
+            });
+        )+
+        monitor
+    }};
 }
 
-#[derive(serde::Serialize)]
-struct QueueStatus {
-    queue: String,
-    stream_key: String,
-    total_messages: i64,
-    pending_total: i64,
-    min_id: String,
-    max_id: String,
-    consumer_stats: Vec<ConsumerStatus>,
-    pending_details: Vec<PendingDetail>,
+fn redact_url_credentials(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let host_onwards = &after_scheme[at_pos..];
+            return format!("{}://***{}", &url[..scheme_end], host_onwards);
+        }
+    }
+    url.to_string()
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    #[cfg(feature = "dotenv")]
-    dotenv::dotenv().ok();
+    #[cfg(feature = "use_dotenv")]
+    dotenvy::dotenv().ok();
 
     #[cfg(feature = "sentry_integration")]
     let _sentry_guard = init_sentry();
 
     // Used to notify Matrix when events occur.
     #[cfg(feature = "matrix_notifs")]
-    let mut matrix_service_opt = None;
+    let mut matrix_service_opt: Option<matrix_notify_service::MatrixNotifyService> = None;
 
     // Inner run function which is wrapped to be able to report errors to Matrix.
     async fn run(
-        #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<MatrixNotifyService>,
+        #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<
+            matrix_notify_service::MatrixNotifyService,
+        >,
+        ready: Arc<AtomicBool>,
     ) -> Result<()> {
         let matches = clap::Command::new("Ordbok API Worker")
             .version(env!("CARGO_PKG_VERSION"))
@@ -110,50 +194,6 @@ async fn main() -> Result<()> {
                             .action(clap::ArgAction::Append),
                     ),
             )
-            .subcommand(
-                clap::Command::new("queues")
-                    .about("Queue operations")
-                    .subcommand(
-                        clap::Command::new("flush")
-                            .long_about("Flush all queues, removing all pending jobs.")
-                            .after_long_help("This is a destructive operation and cannot be undone. If you have flushed all queues and the dictionaries are not in sync, you will need to either resync the dictionaries manually or wait for the next scheduled sync.")
-                            .visible_alias("flushqueues")
-                            .arg(
-                                clap::Arg::new("yes")
-                                    .long("yes")
-                                    .short('y')
-                                    .help("Skip the confirmation prompt and flush all queues immediately.")
-                                    .action(clap::ArgAction::SetTrue),
-                            ),
-                    )
-                    .subcommand(
-                        clap::Command::new("status")
-                            .about("Display the status of the job queues")
-                            .arg(
-                                clap::Arg::new("output")
-                                    .long("output")
-                                    .short('o')
-                                    .value_name("FORMAT")
-                                    .help("Output format: text or json")
-                                    .default_value("text")
-                                    .value_parser(["text", "json"]),
-                            ),
-                    )
-                    .subcommand(
-                        clap::Command::new("resync")
-                            .about("Queue a resync of all dictionaries without running them immediately")
-                            .after_long_help("This command queues resync tasks for dictionaries and then exits.")
-                            .arg(
-                                clap::Arg::new("dictionary")
-                                    .long("dictionary")
-                                    .short('d')
-                                    .value_name("DICTIONARY")
-                                    .help("Dictionary to resync. If omitted, all dictionaries will be queued for resync. Can be specified multiple times.")
-                                    .value_parser(value_parser!(UibDictionary))
-                                    .action(clap::ArgAction::Append),
-                            ),
-                    )
-            )
             .get_matches();
 
         let log_level = matches
@@ -161,117 +201,14 @@ async fn main() -> Result<()> {
             .map(String::as_str)
             .unwrap_or("info");
 
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
             .init();
 
-        // Handle the queues subcommand branch.
-        if let Some(("queues", queues_sub)) = matches.subcommand() {
-            match queues_sub.subcommand() {
-                Some(("flush", subcmd)) => {
-                    if !subcmd.get_flag("yes") {
-                        eprintln!("Flushing all queues is a destructive operation and cannot be undone. Are you sure you want to continue? (y/N)");
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input)?;
-                        if input.trim().to_lowercase() != "y" {
-                            eprintln!("Received input other than 'y', exiting.");
-                            return Ok(());
-                        }
-                    } else {
-                        eprintln!("--yes/-y passed to flush, skipping confirmation prompt.");
-                    };
-
-                    eprintln!("Flushing all queues…");
-                    // Connect to Redis.
-                    let redis_url = std::env::var("REDIS_URL")
-                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-                    let redis_client = redis::Client::open(redis_url.clone())?;
-                    let conn_info = redis_client.get_connection_info();
-
-                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
-
-                    let mut job_queue = JobQueueService {
-                        redis_client: redis_client.clone(),
-                        redis_connection_manager: redis_client.get_connection_manager().await?,
-                    };
-                    job_queue.setup_consumer_groups(true).await?;
-                    eprintln!("All queues have been flushed.");
-                    return Ok(());
-                }
-                Some(("status", subcmd)) => {
-                    let output_format = subcmd
-                        .get_one::<String>("output")
-                        .map(String::as_str)
-                        .unwrap_or("text");
-                    let redis_url = std::env::var("REDIS_URL")
-                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-                    let redis_client = redis::Client::open(redis_url.clone())?;
-                    let conn_info = redis_client.get_connection_info();
-
-                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
-
-                    handle_queue_status(&redis_client, output_format).await?;
-                    return Ok(());
-                }
-                Some(("resync", subcmd)) => {
-                    let redis_url = std::env::var("REDIS_URL")
-                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-                    let redis_client = redis::Client::open(redis_url.clone())?;
-                    let conn_info = redis_client.get_connection_info();
-                    eprintln!("Connecting to Redis at {}…", conn_info.addr);
-
-                    // Create separate connection managers for queues and data.
-                    let redis_connection_manager_queues =
-                        redis_client.get_connection_manager().await?;
-                    let redis_connection_manager_data =
-                        redis_client.get_connection_manager().await?;
-                    let mut job_queue = JobQueueService {
-                        redis_client: redis_client.clone(),
-                        redis_connection_manager: redis_connection_manager_queues.clone(),
-                    };
-                    job_queue.setup_consumer_groups(false).await?;
-
-                    #[cfg(feature = "matrix_notifs")]
-                    let matrix_service = MatrixNotifyService::new(job_queue.clone()).await;
-
-                    let mut sync_service = ArticleSyncService {
-                        redis_client: redis_connection_manager_data.clone(),
-                        job_queue: job_queue.clone(),
-                        #[cfg(feature = "matrix_notifs")]
-                        matrix_service,
-                    };
-
-                    let dicts = subcmd
-                        .get_many::<UibDictionary>("dictionary")
-                        .unwrap_or_default()
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    let dicts = if dicts.is_empty() {
-                        eprintln!("Queueing resync for all dictionaries.");
-                        UibDictionary::all().to_vec()
-                    } else {
-                        eprintln!("Queueing resync for dictionaries: {:?}", dicts);
-                        dicts
-                    };
-
-                    for d in dicts {
-                        eprintln!("Queueing resync tasks for dictionary {:?}…", d);
-                        if let Err(e) = sync_service.enqueue_sync_articles(d).await {
-                            eprintln!("enqueue_sync_articles error: {e}");
-                        }
-                        if let Err(e) = sync_service.enqueue_sync_dict_metadata(d).await {
-                            eprintln!("enqueue_sync_dict_metadata error: {e}");
-                        }
-                    }
-                    eprintln!("Resync tasks have been queued. Exiting.");
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
-        let resync_dictionaries = if let Some("resync") = matches.subcommand_name() {
-            let subcmd = matches.subcommand_matches("resync").unwrap();
+        let resync_dictionaries = if let Some(subcmd) = matches.subcommand_matches("resync") {
             let dicts = subcmd
                 .get_many::<UibDictionary>("dictionary")
                 .unwrap_or_default()
@@ -292,61 +229,86 @@ async fn main() -> Result<()> {
         let num_workers = num_cpus::get();
         info!("Launching Ordbok API sync worker with up to {num_workers} threads.");
 
-        // Connect to Redis
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost:5432/ordbokapi".to_string());
+        info!("Connecting to PostgreSQL…");
+
+        let db = PgPoolOptions::new()
+            .max_connections(20)
+            .connect(&database_url)
+            .await?;
+
+        info!("Connected to PostgreSQL.");
+
+        info!("Running database migrations…");
+        sqlx::migrate!("./migrations").run(&db).await?;
+        info!("Migrations complete.");
+
+        let meili_url =
+            std::env::var("MEILI_URL").unwrap_or_else(|_| "http://127.0.0.1:7700".to_string());
+        let meili_key = std::env::var("MEILI_API_KEY").ok();
+        info!(
+            "Connecting to Meilisearch at {}…",
+            redact_url_credentials(&meili_url)
+        );
+
+        let meili = MeiliClient::new(&meili_url, meili_key.as_deref())?;
+
+        meili::setup_indexes(&meili).await?;
+        info!("Meilisearch indexes configured.");
+
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let redis_client = redis::Client::open(redis_url.clone())?;
-        let conn_info = redis_client.get_connection_info();
+        info!(
+            "Connecting to Redis at {}… for job queues…",
+            redact_url_credentials(&redis_url)
+        );
 
-        info!("Connecting to Redis at {}…", conn_info.addr);
+        let redis_conn = apalis_redis::connect(redis_url).await?;
 
-        let redis_connection_manager_queues = redis_client.get_connection_manager().await?;
-        let redis_connection_manager_data = redis_client.get_connection_manager().await?;
+        let fetch_article_list_storage =
+            redis_storage::<FetchArticleListJob>(&redis_conn, "apalis:article-list");
+        let fetch_article_storage = redis_storage::<FetchArticleJob>(&redis_conn, "apalis:article");
+        let fetch_dict_metadata_storage =
+            redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
+
+        #[cfg(feature = "matrix_notifs")]
+        let matrix_message_storage =
+            redis_storage::<SendMatrixMessageJob>(&redis_conn, "apalis:matrix-notify");
 
         info!("Connected to Redis.");
 
-        // Run migrations.
-        let mut migrator = MigrationService {
-            redis_client: redis_connection_manager_data.clone(),
-        };
-        if let Err(e) = migrator.migrate().await {
-            error!("Failed to run Redis migrations: {e:?}");
-            return Err(e);
-        }
-
-        // Setup consumer groups.
-        let mut job_queue = JobQueueService {
-            redis_client: redis_client.clone(),
-            redis_connection_manager: redis_connection_manager_queues.clone(),
-        };
-        job_queue.setup_consumer_groups(false).await?;
-
-        // Initialize MatrixNotifyService
         #[cfg(feature = "matrix_notifs")]
         {
-            let matrix_service = MatrixNotifyService::new(job_queue.clone()).await;
-            *matrix_service_opt = Some(matrix_service);
+            let ms = matrix_notify_service::MatrixNotifyService::new().await;
+            *matrix_service_opt = Some(ms);
         }
 
-        // Create the ArticleSyncService.
-        let mut sync_service = ArticleSyncService {
-            redis_client: redis_connection_manager_data.clone(),
-            job_queue: job_queue.clone(),
+        let sync_service = ArticleSyncService {
+            db: db.clone(),
+            meili: meili.clone(),
+            redis_conn: redis_conn.clone(),
+            fetch_article_list_storage: fetch_article_list_storage.clone(),
+            fetch_article_storage: fetch_article_storage.clone(),
+            fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
             #[cfg(feature = "matrix_notifs")]
-            matrix_service: matrix_service_opt
-                .as_ref()
-                .expect("MatrixNotifyService not initialized.")
-                .clone(),
+            matrix_message_storage: matrix_message_storage.clone(),
         };
 
-        // Perform initial sync checks.
         if resync_dictionaries.is_empty() {
             info!("Checking if initial sync is required…");
             sync_service.initial_sync().await?;
         } else {
+            // Flush all pending jobs before enqueueing fresh resync tasks.
+            info!("Flushing existing job queues before resync…");
+            redis::cmd("FLUSHDB")
+                .query_async::<()>(&mut redis_conn.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to flush Redis: {e}"))?;
+            info!("Job queues flushed.");
+
             for d in resync_dictionaries {
                 info!("Enqueuing resync tasks for dictionary {:?}…", d);
-
                 if let Err(e) = sync_service.enqueue_sync_articles(d).await {
                     error!("enqueue_sync_articles error: {e}");
                 }
@@ -356,142 +318,109 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Set up cron for daily tasks at 2 AM.
-        info!("Setting up daily sync tasks at 2 AM…");
-        let sched = JobScheduler::new().await?;
-        {
-            let svc = sync_service.clone();
-            #[cfg(feature = "matrix_notifs")]
-            let matrix_svc = matrix_service_opt.clone();
-            sched
-                .add(Job::new_async("0 0 2 * * *", move |_uuid, _l| {
-                    let mut svc2 = svc.clone();
-                    #[cfg(feature = "matrix_notifs")]
-                    let matrix_svc2 = matrix_svc.clone();
-                    Box::pin(async move {
-                        info!("2 AM daily sync tasks fired.");
-                        #[cfg(feature = "matrix_notifs")]
-                        {
-                            matrix_svc2
-                                .expect("MatrixNotifyService not initialized.")
-                                .queue_message("Planlegg daglege synkroniseringsoppgåver.")
-                                .await;
-                        }
-                        for d in UibDictionary::all() {
-                            if let Err(e) = svc2.enqueue_sync_articles(*d).await {
-                                error!("enqueue_sync_articles error: {e}");
-                            }
-                            if let Err(e) = svc2.enqueue_sync_dict_metadata(*d).await {
-                                error!("enqueue_sync_dict_metadata error: {e}");
-                            }
-                        }
-                    })
-                })?)
-                .await?;
-        }
-        sched.start().await?;
+        let svc = sync_service.clone();
+        let job_tracker = JobTracker::default();
+        let article_concurrency = num_workers.clamp(4, 16);
 
-        // Start worker tasks for each queue.
-        {
-            info!("Starting worker group for FetchDictionaryMetadata…");
-            let svc = sync_service.clone();
-            job_queue
-                .start_worker_group(
-                    JobQueue::FetchDictionaryMetadata,
-                    3,
-                    1,
-                    move |job: JobPayload| {
-                        let mut svc2 = svc.clone();
-                        async move {
-                            let dict = match get_dict_id(&job) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    error!("{e}");
-                                    return Ok(());
-                                }
-                            };
-                            svc2.handle_sync_dictionary_metadata(dict).await
-                        }
-                    },
-                )
-                .await?;
-        }
-        {
-            info!("Starting worker group for FetchArticleList…");
-            let svc = sync_service.clone();
-            job_queue
-                .start_worker_group(JobQueue::FetchArticleList, 1, 1, move |job: JobPayload| {
-                    let mut svc2 = svc.clone();
-                    async move {
-                        let dict = match get_dict_id(&job) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                error!("{e}");
-                                return Ok(());
-                            }
-                        };
-                        svc2.handle_sync_articles(dict).await
-                    }
-                })
-                .await?;
-        }
-        {
-            info!("Starting worker group for FetchArticle…");
-            let svc = sync_service.clone();
-            job_queue
-                // CPU thread count = worker count, except minimum 4 workers, maximum 16 workers.
-                .start_worker_group(
-                    JobQueue::FetchArticle,
-                    // Calculate worker count.
-                    num_workers.clamp(4, 16),
-                    1,
-                    move |job: JobPayload| {
-                        let mut svc2 = svc.clone();
-                        async move {
-                            let dict = match get_dict_id(&job) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    error!("{e}");
-                                    return Ok(());
-                                }
-                            };
-                            let meta_val =
-                                job.data.get("metadata").unwrap_or(&serde_json::Value::Null);
-                            svc2.handle_sync_article(dict, meta_val).await
-                        }
-                    },
-                )
-                .await?;
-        }
+        let api = ApiBuilder::new(Router::new())
+            .register(fetch_article_list_storage.clone())
+            .register(fetch_article_storage.clone())
+            .register(fetch_dict_metadata_storage.clone());
+
         #[cfg(feature = "matrix_notifs")]
-        {
-            info!("Starting worker group for MatrixNotify…");
-            let svc = matrix_service_opt.clone();
-            job_queue
-                .start_worker_group(JobQueue::MatrixNotify, 1, 1, move |job: JobPayload| {
-                    let svc2 = svc.clone();
-                    async move {
-                        let msg = job.data.get("msg").unwrap_or(&serde_json::Value::Null);
-                        svc2.expect("MatrixNotifyService not initialized.")
-                            .send_message(msg.as_str().unwrap_or_default())
-                            .await;
-                        Ok(())
-                    }
-                })
-                .await?;
-        }
+        let api = api.register(matrix_message_storage.clone());
 
-        // Idle forever.
+        let router = Router::new()
+            .route(
+                "/health",
+                axum::routing::get({
+                    let ready = ready.clone();
+                    move || {
+                        let is_ready = ready.load(Ordering::Relaxed);
+                        async move {
+                            if is_ready {
+                                (
+                                    axum::http::StatusCode::OK,
+                                    axum::Json(serde_json::json!({"status": "ok"})),
+                                )
+                            } else {
+                                (
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    axum::Json(serde_json::json!({"status": "starting"})),
+                                )
+                            }
+                        }
+                    }
+                }),
+            )
+            .nest("/api/v1", api.build())
+            .fallback_service(ServeUI::new());
+
+        let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{http_port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            info!("HTTP server listening on port {http_port}");
+            axum::serve(listener, router).await.unwrap();
+        });
+
         info!("Worker is now running. Press Ctrl+C to exit.");
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        }
+        ready.store(true, Ordering::Relaxed);
+
+        let monitor = register_workers!(Monitor::new(), svc, job_tracker,
+            "fetch-article-list" => fetch_article_list_storage, 1, handle_fetch_article_list;
+            "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
+            "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
+        );
+
+        // Set up cron for daily sync at 2 AM.
+        let schedule: Schedule = "0 0 2 * * *".parse()?;
+        let s = svc.clone();
+        let t = job_tracker.clone();
+        let monitor = monitor.register(move |_| {
+            WorkerBuilder::new("daily-sync")
+                .backend(CronStream::new(schedule.clone()))
+                .data(s.clone())
+                .data(t.clone())
+                .build(handle_daily_sync)
+        });
+
+        #[cfg(feature = "matrix_notifs")]
+        let monitor = {
+            let ms = matrix_service_opt
+                .clone()
+                .unwrap_or_else(matrix_notify_service::MatrixNotifyService::empty);
+            let t = job_tracker.clone();
+            let b = matrix_message_storage;
+            monitor.register(move |_| {
+                WorkerBuilder::new("matrix-notify")
+                    .backend(b.clone())
+                    .concurrency(1)
+                    .data(ms.clone())
+                    .data(t.clone())
+                    .build(handle_matrix_message)
+            })
+        };
+
+        monitor
+            .on_event(|_ctx, e| {
+                let event_str = format!("{e:?}");
+                if event_str.contains("Error") || event_str.contains("Failed") {
+                    tracing::warn!("Worker event: {event_str}");
+                }
+            })
+            .run_with_signal(graceful_shutdown(job_tracker))
+            .await?;
+
+        Ok(())
     }
 
     // Run the main logic and handle errors
+    let ready = Arc::new(AtomicBool::new(false));
     if let Err(err) = run(
         #[cfg(feature = "matrix_notifs")]
         &mut matrix_service_opt,
+        ready,
     )
     .await
     {
@@ -519,186 +448,101 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_queue_status(redis_client: &redis::Client, output_format: &str) -> Result<()> {
-    let conn = redis_client.get_connection_manager().await?;
+async fn handle_fetch_article_list(
+    job: FetchArticleListJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!("Syncing article list for {}", job.dictionary));
+    svc.handle_sync_articles(job).await
+}
 
-    // List of queues. MatrixNotify is added only if the feature is enabled.
-    let queues = vec![
-        crate::queue::JobQueue::FetchArticleList,
-        crate::queue::JobQueue::FetchArticle,
-        crate::queue::JobQueue::FetchDictionaryMetadata,
-        #[cfg(feature = "matrix_notifs")]
-        crate::queue::JobQueue::MatrixNotify,
-    ];
+async fn handle_fetch_article(
+    job: FetchArticleJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!(
+        "Fetching article {} «{}» ({})",
+        job.article_id, job.primary_lemma, job.dictionary
+    ));
+    svc.handle_sync_article(job).await
+}
 
-    const EXTENDED_LIMIT: usize = 10;
+async fn handle_fetch_dict_metadata(
+    job: FetchDictionaryMetadataJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!("Fetching metadata for {}", job.dictionary));
+    svc.handle_sync_dictionary_metadata(job).await
+}
 
-    // Helper function to retrieve and pretty-print a job's payload.
-    async fn get_job_payload(
-        conn: &mut redis::aio::ConnectionManager,
-        stream_key: &str,
-        message_id: &str,
-    ) -> String {
-        let range: Vec<(String, HashMap<String, String>)> = redis::cmd("XRANGE")
-            .arg(stream_key)
-            .arg(message_id)
-            .arg(message_id)
-            .query_async(conn)
+async fn handle_daily_sync(
+    _event: apalis_cron::Tick,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track("Daily sync".to_string());
+    info!("2 AM daily sync tasks fired.");
+
+    #[cfg(feature = "matrix_notifs")]
+    svc.queue_matrix_message("Planlegg daglege synkroniseringsoppgåver.")
+        .await;
+
+    for d in UibDictionary::all() {
+        if let Err(e) = svc.enqueue_sync_articles(*d).await {
+            error!("enqueue_sync_articles error: {e}");
+        }
+        if let Err(e) = svc.enqueue_sync_dict_metadata(*d).await {
+            error!("enqueue_sync_dict_metadata error: {e}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "matrix_notifs")]
+async fn handle_matrix_message(
+    job: SendMatrixMessageJob,
+    matrix_service: Data<matrix_notify_service::MatrixNotifyService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track("Sending Matrix message".to_string());
+    matrix_service.send_message(&job.message).await;
+    Ok(())
+}
+
+/// Shut down gracefully on Ctrl+C.
+async fn graceful_shutdown(tracker: JobTracker) -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await?;
+
+    info!("Received Ctrl+C, shutting down gracefully...");
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let active = tracker.active_jobs();
+        if active.is_empty() {
+            warn!("Still shutting down... Press Ctrl+C again to force exit.");
+        } else {
+            warn!(
+                "Still shutting down, waiting for {} in-flight job(s):\n{}\n\
+                 Press Ctrl+C again to force exit.",
+                active.len(),
+                active
+                    .iter()
+                    .map(|j| format!("  - {j}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+
+        tokio::signal::ctrl_c()
             .await
-            .unwrap_or_default();
-
-        range
-            .first()
-            .and_then(|(_id, fields)| fields.get("payload"))
-            .and_then(|payload_str| serde_json::from_str::<serde_json::Value>(payload_str).ok())
-            .map(|json_val| {
-                serde_json::to_string_pretty(&json_val)
-                    .unwrap_or_else(|_| "Could not parse job payload.".to_string())
-            })
-            .unwrap_or_else(|| "Could not parse job payload.".to_string())
-    }
-
-    // Helper function to pretty-print a duration in milliseconds, from a number of
-    // milliseconds into a string like "6d 01:49:39.13".
-    fn format_duration(ms: i64) -> String {
-        let total_seconds = ms as f64 / 1000.0;
-        let days = (total_seconds / 86400.0).floor() as i64;
-        let rem_after_days = total_seconds - (days as f64 * 86400.0);
-        let hours = (rem_after_days / 3600.0).floor() as i64;
-        let rem_after_hours = rem_after_days - (hours as f64 * 3600.0);
-        let minutes = (rem_after_hours / 60.0).floor() as i64;
-        let seconds = rem_after_hours - (minutes as f64 * 60.0);
-        if days > 0 {
-            format!("{}d {:02}:{:02}:{:05.2}", days, hours, minutes, seconds)
-        } else {
-            format!("{:02}:{:02}:{:05.2}", hours, minutes, seconds)
-        }
-    }
-
-    // Process all queues concurrently.
-    let statuses = futures::future::join_all(queues.into_iter().map(|q| {
-        // Clone the connection manager for each concurrent task.
-        let mut conn = conn.clone();
-        async move {
-            let stream_key = q.to_stream_key();
-            let group_name = q.to_group_name();
-
-            // Retrieve XPENDING summary.
-            let xp_summary: (i64, String, String, Vec<(String, i64)>) = redis::cmd("XPENDING")
-                .arg(stream_key)
-                .arg(group_name)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or((0, "-".to_string(), "-".to_string(), vec![]));
-            let (pending_total, min_id, max_id, consumer_stats_raw) = xp_summary;
-            let consumer_stats = consumer_stats_raw
-                .into_iter()
-                .map(|(name, pending)| ConsumerStatus {
-                    consumer_name: name,
-                    pending,
-                })
-                .collect::<Vec<_>>();
-
-            // Retrieve extended pending details.
-            let extended_details_raw: Vec<(String, String, i64, i64)> = redis::cmd("XPENDING")
-                .arg(stream_key)
-                .arg(group_name)
-                .arg("-")
-                .arg("+")
-                .arg(EXTENDED_LIMIT)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or_default();
-
-            // For each pending message, fetch its job payload.
-            let mut pending_details = Vec::with_capacity(extended_details_raw.len());
-            for (message_id, consumer, idle_time_ms, delivery_count) in extended_details_raw {
-                let job_payload = get_job_payload(&mut conn, stream_key, &message_id).await;
-                pending_details.push(PendingDetail {
-                    message_id,
-                    consumer,
-                    idle_time_ms,
-                    delivery_count,
-                    job_payload,
-                });
-            }
-
-            // Retrieve total messages in the stream.
-            let total_messages: i64 = redis::cmd("XLEN")
-                .arg(stream_key)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(0);
-
-            QueueStatus {
-                queue: format!("{:?}", q),
-                stream_key: stream_key.to_owned(),
-                total_messages,
-                pending_total,
-                min_id,
-                max_id,
-                consumer_stats,
-                pending_details,
-            }
-        }
-    }))
-    .await;
-
-    // Output the result.
-
-    if output_format == "json" {
-        println!("{}", serde_json::to_string_pretty(&statuses)?);
-        return Ok(());
-    }
-
-    for status in statuses {
-        println!("Queue: {}", status.queue);
-        println!("  Stream key: {}", status.stream_key);
-        println!("  Total messages: {}", status.total_messages);
-        println!(
-            "  Pending messages: {} (min: {}, max: {})",
-            status.pending_total, status.min_id, status.max_id
-        );
-        println!("  Consumer stats:");
-        if status.consumer_stats.is_empty() {
-            println!("    (none)");
-        } else {
-            for consumer in &status.consumer_stats {
-                println!(
-                    "    {}: {} pending",
-                    consumer.consumer_name, consumer.pending
-                );
-            }
-        }
-        println!("  Pending job details (up to {}):", EXTENDED_LIMIT);
-        if status.pending_details.is_empty() {
-            println!("    (none)");
-        } else {
-            for detail in &status.pending_details {
-                let formatted_idle = format_duration(detail.idle_time_ms);
-                println!(
-                    "    Message {}: consumer '{}', idle {}, delivered {} times",
-                    detail.message_id, detail.consumer, formatted_idle, detail.delivery_count
-                );
-                println!("      Payload:");
-
-                // Remove outer braces and indent inner lines.
-                if detail.job_payload.starts_with('{') && detail.job_payload.ends_with('}') {
-                    let lines: Vec<&str> = detail.job_payload.lines().collect();
-                    if lines.len() > 2 {
-                        for line in &lines[1..lines.len() - 1] {
-                            println!("        {}", line.trim());
-                        }
-
-                        continue;
-                    }
-                }
-
-                println!("        {}", detail.job_payload);
-            }
-        }
-        println!();
-    }
+            .expect("failed to listen for ctrl+c");
+        error!("Second Ctrl+C received, forcing exit.");
+        std::process::exit(1);
+    });
 
     Ok(())
 }
