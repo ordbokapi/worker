@@ -16,13 +16,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
-if (-not (Test-Path .redis)) {
-    New-Item -ItemType Directory -Name .redis
+if (-not (Test-Path .valkey)) {
+    New-Item -ItemType Directory -Name .valkey
 }
-if (-not (Test-Path .redis-backup)) {
-    New-Item -ItemType Directory -Name .redis-backup
+if (-not (Test-Path .valkey-backup)) {
+    New-Item -ItemType Directory -Name .valkey-backup
 }
 docker compose down
-rm -rec -for .redis
-cp -rec .redis-backup .redis
+rm -rec -for .valkey-backup
+cp -rec .valkey .valkey-backup
+rm -rec -for .valkey
 docker compose up -d

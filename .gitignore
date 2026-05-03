@@ -17,8 +17,8 @@
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
 /target
-.redis
-.redis-backup
 .meilidata
 .pgdata
+.valkey
+.valkey-backup
 .env

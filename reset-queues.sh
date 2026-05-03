@@ -18,9 +18,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
-mkdir -p .redis-backup
-mkdir -p .redis
+mkdir -p .valkey-backup
+mkdir -p .valkey
 docker compose down
-rm -rf .redis
-cp -r .redis-backup .redis
+rm -rf .valkey-backup
+cp -r .valkey .valkey-backup
+rm -rf .valkey
 docker compose up -d

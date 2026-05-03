@@ -22,24 +22,24 @@ services:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: ordbokapi
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ordbokapi
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./.pgdata:/var/lib/postgresql
+      - ./.pgdata:/var/lib/postgresql/data
 
   meilisearch:
     image: getmeili/meilisearch:v1
     environment:
-      MEILI_MASTER_KEY: masterkey
+      MEILI_MASTER_KEY: ${MEILI_API_KEY:-masterkey}
       MEILI_ENV: development
     ports:
-      - "7700:7700"
+      - "${MEILI_PORT:-7700}:7700"
     volumes:
       - ./.meilidata:/meili_data
 
   valkey:
     image: valkey/valkey:9
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
