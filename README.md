@@ -29,7 +29,7 @@ Arbeidarprosessen for å synkronisere dataa frå UiB med Ordbok API sin database
 1. Last ned og installer [Rust](https://www.rust-lang.org/tools/install).
 2. Last ned og installer [Docker](https://docs.docker.com/get-docker/).
 3. Opprett ein kopi av `template.env` og kall den `.env`. Her legg du inn dei nødvendige miljøvariablane.
-4. Køyr `docker-compose up -d` for å starte ein lokal Redis-database.
+4. Køyr `docker-compose up -d` for å starte ein lokal Valkey-database.
 5. Køyr `./run.sh` eller `.\run.ps1` for å byggje og køyre arbeidarprosessen. Du kan ogso køyre `cargo run --features use_dotenv` for å køyre utan støtte for [Matrix](https://matrix.org/)-varsel.
 
 ### Skript
