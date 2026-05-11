@@ -60,5 +60,5 @@ dotenvy = ["dep:dotenvy"]
 debug = true
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 predicates = "3.1.4"
