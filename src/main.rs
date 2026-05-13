@@ -252,9 +252,6 @@ async fn main() -> Result<()> {
 
         let meili = MeiliClient::new(&meili_url, meili_key.as_deref())?;
 
-        meili::setup_indexes(&meili).await?;
-        info!("Meilisearch indexes configured.");
-
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         info!(
@@ -341,6 +338,9 @@ async fn main() -> Result<()> {
             info!("HTTP server listening on port {http_port}");
             axum::serve(listener, router).await.unwrap();
         });
+
+        meili::setup_indexes(&meili).await?;
+        info!("Meilisearch indexes configured.");
 
         meili::reindex_if_needed(&meili, &db).await?;
 
