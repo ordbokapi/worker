@@ -238,10 +238,6 @@ async fn main() -> Result<()> {
 
         info!("Connected to PostgreSQL.");
 
-        info!("Running database migrations…");
-        sqlx::migrate!("./migrations").run(&db).await?;
-        info!("Migrations complete.");
-
         let meili_url =
             std::env::var("MEILI_URL").unwrap_or_else(|_| "http://127.0.0.1:7700".to_string());
         let meili_key = std::env::var("MEILI_API_KEY").ok();
@@ -338,6 +334,10 @@ async fn main() -> Result<()> {
             info!("HTTP server listening on port {http_port}");
             axum::serve(listener, router).await.unwrap();
         });
+
+        info!("Running database migrations…");
+        sqlx::migrate!("./migrations").run(&db).await?;
+        info!("Migrations complete.");
 
         meili::setup_indexes(&meili).await?;
         info!("Meilisearch indexes configured.");
