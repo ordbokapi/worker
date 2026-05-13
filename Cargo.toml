@@ -23,7 +23,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-apalis = { version = "1.0.0-rc.8", features = ["retry", "timeout", "limit", "catch-panic", "tracing"] }
+apalis = { version = "1.0.0-rc.9", features = ["retry", "timeout", "limit", "catch-panic", "tracing"] }
 apalis-board = { version = "1.0.0-rc.7", features = ["axum"] }
 apalis-redis = "1.0.0-rc.7"
 apalis-cron = "1.0.0-rc.7"
