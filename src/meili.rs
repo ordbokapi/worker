@@ -22,7 +22,7 @@ use meilisearch_sdk::settings::Settings;
 use meilisearch_sdk::{client::Client, features::ExperimentalFeatures};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Increment this when the indexes change.
 pub const MEILI_SCHEMA_VERSION: i64 = 2;
@@ -680,9 +680,12 @@ pub fn build_search_document(
 /// Ensure all dictionary indexes exist with correct settings.
 pub async fn setup_indexes(client: &Client) -> Result<()> {
     let mut features = ExperimentalFeatures::new(client);
-
     features.set_contains_filter(true);
-    features.update().await?;
+    if let Err(e) = features.update().await {
+        warn!(
+            "Could not enable experimental features: {e}. Enable them manually if not already done."
+        );
+    }
 
     for dict in ["bm", "nn", "no"] {
         let idx = index_name(dict);
