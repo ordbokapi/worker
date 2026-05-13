@@ -45,7 +45,7 @@ tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 dotenvy = { version = "0.15.7", optional = true }
-matrix-sdk = { version = "0.16.0", optional = true, default-features = false, features = ["rustls-tls", "markdown"] }
+matrix-sdk = { version = "0.17.0", optional = true, default-features = false, features = ["markdown"] }
 pulldown-cmark = { version = "0.13.3", optional = true }
 sentry = { version = "0.48.2", optional = true, default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "rustls", "reqwest", "tracing"] }
 
