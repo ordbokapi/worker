@@ -22,7 +22,6 @@ mod matrix_notify_service;
 mod meili;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Error, Result};
 use apalis::prelude::*;
@@ -41,8 +40,8 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info, warn};
 
 use crate::article_sync_service::{
-    ArticleSyncService, FetchArticleJob, FetchArticleListJob, FetchDictionaryMetadataJob,
-    UibDictionary,
+    ArticleSyncService, FetchArticleJob, FetchArticleListJob, FetchBibliographyJob,
+    FetchDictionaryMetadataJob, UibDictionary,
 };
 
 #[cfg(feature = "matrix_notifs")]
@@ -165,7 +164,6 @@ async fn main() -> Result<()> {
         #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<
             matrix_notify_service::MatrixNotifyService,
         >,
-        ready: Arc<AtomicBool>,
     ) -> Result<()> {
         let matches = clap::Command::new("Ordbok API Worker")
             .version(env!("CARGO_PKG_VERSION"))
@@ -271,6 +269,8 @@ async fn main() -> Result<()> {
         let fetch_article_storage = redis_storage::<FetchArticleJob>(&redis_conn, "apalis:article");
         let fetch_dict_metadata_storage =
             redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
+        let fetch_bibliography_storage =
+            redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
 
         #[cfg(feature = "matrix_notifs")]
         let matrix_message_storage =
@@ -284,13 +284,75 @@ async fn main() -> Result<()> {
             *matrix_service_opt = Some(ms);
         }
 
+        let health_db = db.clone();
+        let health_redis = redis_conn.clone();
+        let health_meili = meili.clone();
+
+        let api = ApiBuilder::new(Router::new())
+            .register(fetch_article_list_storage.clone())
+            .register(fetch_article_storage.clone())
+            .register(fetch_dict_metadata_storage.clone())
+            .register(fetch_bibliography_storage.clone());
+
+        #[cfg(feature = "matrix_notifs")]
+        let api = api.register(matrix_message_storage.clone());
+
+        let router = Router::new()
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let db = health_db.clone();
+                    let mut redis = health_redis.clone();
+                    let meili = health_meili.clone();
+                    async move {
+                        let db_ok = sqlx::query("SELECT 1").execute(&db).await.is_ok();
+                        let redis_ok = redis::cmd("PING")
+                            .query_async::<String>(&mut redis)
+                            .await
+                            .is_ok();
+                        let meili_ok = meili.health().await.is_ok();
+
+                        if db_ok && redis_ok && meili_ok {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"status": "ok"})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(serde_json::json!({
+                                    "status": "unhealthy",
+                                    "db": db_ok,
+                                    "redis": redis_ok,
+                                    "meili": meili_ok,
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .nest("/api/v1", api.build())
+            .fallback_service(ServeUI::new());
+
+        let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{http_port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            info!("HTTP server listening on port {http_port}");
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        meili::reindex_if_needed(&meili, &db).await?;
+
         let sync_service = ArticleSyncService {
             db: db.clone(),
             meili: meili.clone(),
             redis_conn: redis_conn.clone(),
+            clarino_api_key: std::env::var("CLARINO_API_KEY").ok(),
             fetch_article_list_storage: fetch_article_list_storage.clone(),
             fetch_article_storage: fetch_article_storage.clone(),
             fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
+            fetch_bibliography_storage: fetch_bibliography_storage.clone(),
             #[cfg(feature = "matrix_notifs")]
             matrix_message_storage: matrix_message_storage.clone(),
         };
@@ -318,59 +380,21 @@ async fn main() -> Result<()> {
             }
         }
 
+        if let Err(e) = sync_service.enqueue_initial_bibliography_sync().await {
+            error!("Initial bibliography sync enqueue failed: {e}");
+        }
+
         let svc = sync_service.clone();
         let job_tracker = JobTracker::default();
         let article_concurrency = num_workers.clamp(4, 16);
 
-        let api = ApiBuilder::new(Router::new())
-            .register(fetch_article_list_storage.clone())
-            .register(fetch_article_storage.clone())
-            .register(fetch_dict_metadata_storage.clone());
-
-        #[cfg(feature = "matrix_notifs")]
-        let api = api.register(matrix_message_storage.clone());
-
-        let router = Router::new()
-            .route(
-                "/health",
-                axum::routing::get({
-                    let ready = ready.clone();
-                    move || {
-                        let is_ready = ready.load(Ordering::Relaxed);
-                        async move {
-                            if is_ready {
-                                (
-                                    axum::http::StatusCode::OK,
-                                    axum::Json(serde_json::json!({"status": "ok"})),
-                                )
-                            } else {
-                                (
-                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                    axum::Json(serde_json::json!({"status": "starting"})),
-                                )
-                            }
-                        }
-                    }
-                }),
-            )
-            .nest("/api/v1", api.build())
-            .fallback_service(ServeUI::new());
-
-        let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-        tokio::spawn(async move {
-            let addr = format!("0.0.0.0:{http_port}");
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            info!("HTTP server listening on port {http_port}");
-            axum::serve(listener, router).await.unwrap();
-        });
-
         info!("Worker is now running. Press Ctrl+C to exit.");
-        ready.store(true, Ordering::Relaxed);
 
         let monitor = register_workers!(Monitor::new(), svc, job_tracker,
             "fetch-article-list" => fetch_article_list_storage, 1, handle_fetch_article_list;
             "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
             "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
+            "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
         );
 
         // Set up cron for daily sync at 2 AM.
@@ -416,11 +440,9 @@ async fn main() -> Result<()> {
     }
 
     // Run the main logic and handle errors
-    let ready = Arc::new(AtomicBool::new(false));
     if let Err(err) = run(
         #[cfg(feature = "matrix_notifs")]
         &mut matrix_service_opt,
-        ready,
     )
     .await
     {
@@ -476,6 +498,15 @@ async fn handle_fetch_dict_metadata(
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching metadata for {}", job.dictionary));
     svc.handle_sync_dictionary_metadata(job).await
+}
+
+async fn handle_fetch_bibliography(
+    job: FetchBibliographyJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!("Fetching bibliography {}", job.bibl_id));
+    svc.handle_sync_bibliography(job.bibl_id).await
 }
 
 async fn handle_daily_sync(

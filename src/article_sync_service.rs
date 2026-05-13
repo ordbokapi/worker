@@ -24,7 +24,7 @@ use meilisearch_sdk::client::Client as MeiliClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
 use crate::meili;
@@ -104,9 +104,16 @@ pub struct FetchDictionaryMetadataJob {
 }
 
 /// Send a Matrix notification message.
+#[cfg(feature = "matrix_notifs")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMatrixMessageJob {
     pub message: String,
+}
+
+/// Fetch a single bibliography entry from the word bank API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchBibliographyJob {
+    pub bibl_id: i64,
 }
 
 /// Main service that handles fetch and store logic.
@@ -115,9 +122,11 @@ pub struct ArticleSyncService {
     pub db: PgPool,
     pub meili: MeiliClient,
     pub redis_conn: ConnectionManager,
+    pub clarino_api_key: Option<String>,
     pub fetch_article_list_storage: RedisStorage<FetchArticleListJob>,
     pub fetch_article_storage: RedisStorage<FetchArticleJob>,
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
+    pub fetch_bibliography_storage: RedisStorage<FetchBibliographyJob>,
     #[cfg(feature = "matrix_notifs")]
     pub matrix_message_storage: RedisStorage<SendMatrixMessageJob>,
 }
@@ -159,6 +168,21 @@ impl ArticleSyncService {
             .await
             .map_err(|e| anyhow!("Redis pipeline SET EX failed: {e}"))?;
         Ok(())
+    }
+
+    /// Mark a bibliography entry as queued.
+    async fn try_mark_bibl_queued(&self, bibl_id: i64) -> Result<bool> {
+        let key = format!("ordbokapi:bibl-queued:{bibl_id}");
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(Self::DEDUPE_TTL)
+            .query_async(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Redis SET NX EX failed: {e}"))?;
+        Ok(result.is_some())
     }
 
     /// Queue a Matrix notification message for delivery.
@@ -245,7 +269,9 @@ impl ArticleSyncService {
         // Prepare a vector to hold all the JSON payloads for articles we need to sync.
         let mut to_enqueue = Vec::new();
         let mut new_id_set = std::collections::HashSet::new();
+        #[cfg(feature = "matrix_notifs")]
         let mut new_count = 0u32;
+        #[cfg(feature = "matrix_notifs")]
         let mut updated_count = 0u32;
 
         for raw_meta in article_list.drain(..) {
@@ -260,13 +286,19 @@ impl ArticleSyncService {
                     "[{:?}] Article {} ({}) changed",
                     dict, meta.article_id, meta.primary_lemma
                 );
-                updated_count += 1;
+                #[cfg(feature = "matrix_notifs")]
+                {
+                    updated_count += 1;
+                }
             } else {
                 debug!(
                     "[{:?}] New article {} ({})",
                     dict, meta.article_id, meta.primary_lemma
                 );
-                new_count += 1;
+                #[cfg(feature = "matrix_notifs")]
+                {
+                    new_count += 1;
+                }
             }
 
             to_enqueue.push(FetchArticleJob {
@@ -382,6 +414,8 @@ impl ArticleSyncService {
         // Index in Meilisearch.
         self.index_article(dict, job.article_id, &article_json)
             .await?;
+
+        self.enqueue_bibliography_for_article(&article_json).await?;
 
         info!(
             "[{:?}] Article {} ({}) stored and indexed",
@@ -612,7 +646,8 @@ impl ArticleSyncService {
         article_id: i64,
         article_data: &Value,
     ) -> Result<()> {
-        let doc = meili::build_search_document(dict.as_str(), article_id, article_data);
+        let bib = self.load_article_bibliography(article_data).await?;
+        let doc = meili::build_search_document(dict.as_str(), article_id, article_data, Some(&bib));
         let idx = self.meili.index(meili::index_name(dict.as_str()));
 
         idx.add_or_replace(&[doc], Some("id"))
@@ -620,6 +655,57 @@ impl ArticleSyncService {
             .map_err(|e| anyhow!("Failed to index article in Meilisearch: {e}"))?;
 
         Ok(())
+    }
+
+    /// Load bibliography metadata for an article.
+    async fn load_article_bibliography(
+        &self,
+        article_data: &Value,
+    ) -> Result<meili::ArticleBibliography> {
+        let bibl_ids = Self::extract_bibl_ids(article_data);
+        if bibl_ids.is_empty() {
+            return Ok(meili::ArticleBibliography {
+                older_source: meili::BibliographyCategory {
+                    codes: vec![],
+                    authors: vec![],
+                    titles: vec![],
+                    years: vec![],
+                },
+                written_form_source: meili::BibliographyCategory {
+                    codes: vec![],
+                    authors: vec![],
+                    titles: vec![],
+                    years: vec![],
+                },
+                attestation_source: meili::BibliographyCategory {
+                    codes: vec![],
+                    authors: vec![],
+                    titles: vec![],
+                    years: vec![],
+                },
+                all: meili::BibliographyCategory {
+                    codes: vec![],
+                    authors: vec![],
+                    titles: vec![],
+                    years: vec![],
+                },
+            });
+        }
+
+        let ids_vec: Vec<i64> = bibl_ids.into_iter().collect();
+        let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, code, author, title, year FROM bibliography WHERE id = ANY($1)",
+        )
+        .bind(&ids_vec)
+        .fetch_all(&self.db)
+        .await?;
+
+        let bib_map: std::collections::HashMap<i64, (String, String, String, String)> = rows
+            .into_iter()
+            .map(|(id, code, author, title, year)| (id, (code, author, title, year)))
+            .collect();
+
+        Ok(meili::build_article_bibliography(article_data, &bib_map))
     }
 
     /// Retrieve all known articles from PostgreSQL.
@@ -661,6 +747,221 @@ impl ArticleSyncService {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string()
+    }
+
+    /// Extract all bibl_id values from an article.
+    fn extract_bibl_ids(article: &Value) -> HashSet<i64> {
+        let mut ids = HashSet::new();
+        Self::collect_bibl_ids(article, &mut ids);
+        ids
+    }
+
+    fn collect_bibl_ids(value: &Value, ids: &mut HashSet<i64>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(bibl_id) = map.get("bibl_id").and_then(|v| v.as_i64()) {
+                    ids.insert(bibl_id);
+                }
+                for v in map.values() {
+                    Self::collect_bibl_ids(v, ids);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    Self::collect_bibl_ids(v, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Enqueue bibliography fetch jobs for any bibliography IDs in an article
+    /// that are not already present in the database.
+    async fn enqueue_bibliography_for_article(&self, article: &Value) -> Result<()> {
+        let bibl_ids = Self::extract_bibl_ids(article);
+        if bibl_ids.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_bibliography_ids(&bibl_ids).await
+    }
+
+    /// Enqueue bibliography fetch jobs for IDs not yet in the database.
+    pub async fn enqueue_bibliography_ids(&self, bibl_ids: &HashSet<i64>) -> Result<()> {
+        if self.clarino_api_key.is_none() {
+            debug!("No CLARINO_API_KEY set, skipping bibliography enqueue.");
+            return Ok(());
+        }
+
+        let ids_vec: Vec<i64> = bibl_ids.iter().copied().collect();
+        let existing: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM bibliography WHERE id = ANY($1)")
+                .bind(&ids_vec)
+                .fetch_all(&self.db)
+                .await?;
+
+        let existing_set: HashSet<i64> = existing.into_iter().map(|(id,)| id).collect();
+        let missing: Vec<i64> = ids_vec
+            .into_iter()
+            .filter(|id| !existing_set.contains(id))
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let mut storage = self.fetch_bibliography_storage.clone();
+        let mut enqueued = 0usize;
+        for bibl_id in missing {
+            if self.try_mark_bibl_queued(bibl_id).await? {
+                storage.push(FetchBibliographyJob { bibl_id }).await?;
+                enqueued += 1;
+            }
+        }
+
+        if enqueued > 0 {
+            info!("Enqueued {enqueued} bibliography fetch jobs");
+        }
+
+        Ok(())
+    }
+
+    /// Enqueue bibliography jobs for all articles.
+    pub async fn enqueue_initial_bibliography_sync(&self) -> Result<()> {
+        if self.clarino_api_key.is_none() {
+            info!("No CLARINO_API_KEY set, skipping initial bibliography sync.");
+            return Ok(());
+        }
+
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT val::bigint FROM articles, \
+             LATERAL jsonb_path_query(data, '$.**.bibl_id') AS val \
+             WHERE val IS NOT NULL AND jsonb_typeof(val) = 'number'",
+        )
+        .fetch_all(&self.db)
+        .await?;
+
+        let all_bibl_ids: HashSet<i64> = rows.into_iter().map(|(id,)| id).collect();
+
+        if all_bibl_ids.is_empty() {
+            info!("No bibliography IDs found in articles.");
+            return Ok(());
+        }
+
+        info!(
+            "Found {} unique bibliography IDs across all articles, enqueueing missing entries…",
+            all_bibl_ids.len()
+        );
+
+        self.enqueue_bibliography_ids(&all_bibl_ids).await?;
+
+        info!("Initial bibliography sync jobs enqueued.");
+        Ok(())
+    }
+
+    /// Handle a single bibliography fetch job.
+    pub async fn handle_sync_bibliography(&self, bibl_id: i64) -> Result<()> {
+        let api_key = self
+            .clarino_api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("CLARINO_API_KEY not set"))?;
+
+        let entry = self.fetch_bibliography_entry(api_key, bibl_id).await?;
+        self.store_bibliography_entry(bibl_id, &entry).await?;
+        self.index_bibliography_entry(bibl_id, &entry).await?;
+
+        // Re-index articles that reference this bibliography ID so their
+        // bibliography fields are up to date.
+        self.reindex_articles_for_bibl(bibl_id).await?;
+
+        info!("Bibliography entry {bibl_id} synced");
+        Ok(())
+    }
+
+    /// Re-index all articles that reference a given bibliography ID.
+    async fn reindex_articles_for_bibl(&self, bibl_id: i64) -> Result<()> {
+        let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+            "SELECT dictionary, id, data FROM articles \
+             WHERE jsonb_path_exists(data, '$.**.bibl_id ? (@ == $id)', \
+             jsonb_build_object('id', $1))",
+        )
+        .bind(bibl_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Re-indexing {} articles for bibliography {bibl_id}",
+            rows.len()
+        );
+
+        for (dict_str, article_id, data) in &rows {
+            let dict = Self::parse_dict(dict_str)?;
+            if let Err(e) = self.index_article(dict, *article_id, data).await {
+                warn!("Failed to re-index article {article_id} for bibl {bibl_id}: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch a single bibliography entry.
+    async fn fetch_bibliography_entry(&self, api_key: &str, bibl_id: i64) -> Result<Value> {
+        let url = format!("https://clarino.uib.no/ordbank-api-prod/bibl/{bibl_id}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        let data: Value = resp.json().await?;
+        let entry = data
+            .as_array()
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| anyhow!("Empty response for bibliography {bibl_id}"))?;
+        Ok(entry)
+    }
+
+    /// Store a bibliography entry in PostgreSQL.
+    async fn store_bibliography_entry(&self, bibl_id: i64, entry: &Value) -> Result<()> {
+        let code = entry.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let author = entry.get("author").and_then(|v| v.as_str()).unwrap_or("");
+        let title = entry.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let year = entry.get("year").and_then(|v| v.as_str()).unwrap_or("");
+        let empty_arr = Value::Array(vec![]);
+        let fields = entry.get("fields").unwrap_or(&empty_arr);
+
+        sqlx::query(
+            "INSERT INTO bibliography (id, code, author, title, year, fields, fetched_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (id) DO UPDATE
+             SET code = $2, author = $3, title = $4, year = $5, fields = $6, fetched_at = now()",
+        )
+        .bind(bibl_id)
+        .bind(code)
+        .bind(author)
+        .bind(title)
+        .bind(year)
+        .bind(fields)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Index a bibliography entry in Meilisearch.
+    async fn index_bibliography_entry(&self, bibl_id: i64, entry: &Value) -> Result<()> {
+        let doc = meili::build_bibliography_document(bibl_id, entry);
+        let idx = self.meili.index(meili::BIBLIOGRAPHY_INDEX);
+
+        idx.add_or_replace(&[doc], Some("id"))
+            .await
+            .map_err(|e| anyhow!("Failed to index bibliography in Meilisearch: {e}"))?;
+
+        Ok(())
     }
 
     /// After we've synced an article, queue any related articles from sub_article or article_ref
