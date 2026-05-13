@@ -620,6 +620,9 @@ impl ArticleSyncService {
         updated_at: &str,
     ) -> Result<()> {
         let dict_str = dict.as_str();
+        let bibl_ids: Vec<i64> = Self::extract_bibl_ids(article_data).into_iter().collect();
+
+        let mut tx = self.db.begin().await?;
 
         sqlx::query(
             "INSERT INTO articles (dictionary, id, data, primary_lemma, revision, updated_at, modified_at)
@@ -633,8 +636,29 @@ impl ArticleSyncService {
         .bind(primary_lemma)
         .bind(revision)
         .bind(updated_at)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query("DELETE FROM article_bibliography WHERE dictionary = $1 AND article_id = $2")
+            .bind(dict_str)
+            .bind(article_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if !bibl_ids.is_empty() {
+            sqlx::query(
+                "INSERT INTO article_bibliography (dictionary, article_id, bibl_id) \
+                 SELECT $1, $2, unnest($3::bigint[]) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(dict_str)
+            .bind(article_id)
+            .bind(&bibl_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -832,13 +856,9 @@ impl ArticleSyncService {
             return Ok(());
         }
 
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT DISTINCT val::bigint FROM articles, \
-             LATERAL jsonb_path_query(data, '$.**.bibl_id') AS val \
-             WHERE val IS NOT NULL AND jsonb_typeof(val) = 'number'",
-        )
-        .fetch_all(&self.db)
-        .await?;
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT DISTINCT bibl_id FROM article_bibliography")
+            .fetch_all(&self.db)
+            .await?;
 
         let all_bibl_ids: HashSet<i64> = rows.into_iter().map(|(id,)| id).collect();
 
@@ -880,9 +900,10 @@ impl ArticleSyncService {
     /// Re-index all articles that reference a given bibliography ID.
     async fn reindex_articles_for_bibl(&self, bibl_id: i64) -> Result<()> {
         let rows: Vec<(String, i64, Value)> = sqlx::query_as(
-            "SELECT dictionary, id, data FROM articles \
-             WHERE jsonb_path_exists(data, '$.**.bibl_id ? (@ == $id)', \
-             jsonb_build_object('id', $1))",
+            "SELECT a.dictionary, a.id, a.data FROM articles a \
+             INNER JOIN article_bibliography ab \
+             ON a.dictionary = ab.dictionary AND a.id = ab.article_id \
+             WHERE ab.bibl_id = $1",
         )
         .bind(bibl_id)
         .fetch_all(&self.db)
