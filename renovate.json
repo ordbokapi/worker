@@ -1,6 +1,19 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["rust-toolchain\\.toml$"],
+      "matchStrings": [
+        "channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "rust",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch"],
@@ -13,7 +26,8 @@
     },
     {
       "matchDepNames": ["rust"],
-      "automerge": false
+      "automerge": false,
+      "groupName": "rust"
     },
     {
       "matchPackageNames": ["apalis**"],
