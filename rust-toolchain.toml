@@ -17,4 +17,4 @@
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
 [toolchain]
-channel = "1.93.1"
+channel = "1.95.0"
