@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Increment this when the indexes change.
-pub const MEILI_SCHEMA_VERSION: i64 = 2;
+pub const MEILI_SCHEMA_VERSION: i64 = 3;
 
 /// The document shape indexed into Meilisearch for search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +96,24 @@ pub struct ArticleSearchDocument {
     pub bibliography_titles: Vec<String>,
     /// Publication years from all bibliographical entries.
     pub bibliography_years: Vec<String>,
+    /// Place names from all referenced places.
+    pub place_names: Vec<String>,
+    /// Place codes from all referenced places.
+    pub place_codes: Vec<String>,
+    /// Place types from all referenced places.
+    pub place_types: Vec<String>,
+    /// Place names from dialect context places.
+    pub dialect_place_names: Vec<String>,
+    /// Place codes from dialect context places.
+    pub dialect_place_codes: Vec<String>,
+    /// Place types from dialect context places.
+    pub dialect_place_types: Vec<String>,
+    /// Place names from attestation context places.
+    pub attestation_place_names: Vec<String>,
+    /// Place codes from attestation context places.
+    pub attestation_place_codes: Vec<String>,
+    /// Place types from attestation context places.
+    pub attestation_place_types: Vec<String>,
 }
 
 /// The index name for bibliography entries.
@@ -109,6 +127,99 @@ pub struct BibliographySearchDocument {
     pub author: String,
     pub title: String,
     pub year: String,
+}
+
+/// The index name for place entries.
+pub const PLACE_INDEX: &str = "places";
+
+/// Place entry indexed in Meilisearch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaceSearchDocument {
+    pub id: i64,
+    pub place_name: String,
+    pub place_name_full: String,
+    pub place_type: String,
+    pub parent_id: Option<i64>,
+    pub municipality_nr: Option<String>,
+}
+
+/// Place metadata to embed in an article search document.
+#[derive(Default)]
+pub struct ArticlePlaceData {
+    pub dialect_names: Vec<String>,
+    pub dialect_codes: Vec<String>,
+    pub dialect_types: Vec<String>,
+    pub attestation_names: Vec<String>,
+    pub attestation_codes: Vec<String>,
+    pub attestation_types: Vec<String>,
+    pub names: Vec<String>,
+    pub codes: Vec<String>,
+    pub types: Vec<String>,
+}
+
+/// Collect unique names, codes, and types from a slice of place IDs.
+fn collect_place_fields(
+    ids: &[i64],
+    place_map: &std::collections::HashMap<i64, (String, String, String)>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut codes = Vec::new();
+    let mut types = Vec::new();
+
+    for &id in ids {
+        if let Some((code, full_name, place_type)) = place_map.get(&id) {
+            let display_name = if full_name.is_empty() {
+                code
+            } else {
+                full_name
+            };
+            if !display_name.is_empty() && !names.contains(display_name) {
+                names.push(display_name.clone());
+            }
+            if !code.is_empty() && !codes.contains(code) {
+                codes.push(code.clone());
+            }
+            if !place_type.is_empty() && !types.contains(place_type) {
+                types.push(place_type.clone());
+            }
+        }
+    }
+
+    (names, codes, types)
+}
+
+/// Build split place metadata.
+pub fn build_article_place_data_split(
+    dialect_ids: &[i64],
+    attestation_ids: &[i64],
+    place_map: &std::collections::HashMap<i64, (String, String, String)>,
+) -> ArticlePlaceData {
+    let (dialect_names, dialect_codes, dialect_types) =
+        collect_place_fields(dialect_ids, place_map);
+    let (attestation_names, attestation_codes, attestation_types) =
+        collect_place_fields(attestation_ids, place_map);
+
+    // Combined: union of both
+    let all_ids: Vec<i64> = dialect_ids
+        .iter()
+        .chain(attestation_ids.iter())
+        .copied()
+        .collect::<std::collections::HashSet<i64>>()
+        .into_iter()
+        .collect();
+    let (names, codes, types) = collect_place_fields(&all_ids, place_map);
+
+    ArticlePlaceData {
+        dialect_names,
+        dialect_codes,
+        dialect_types,
+        attestation_names,
+        attestation_codes,
+        attestation_types,
+        names,
+        codes,
+        types,
+    }
 }
 
 /// Build a `BibliographySearchDocument` from a Clarino API response entry.
@@ -346,6 +457,7 @@ pub fn build_search_document(
     article_id: i64,
     data: &serde_json::Value,
     bibliography: Option<&ArticleBibliography>,
+    place_data: Option<&ArticlePlaceData>,
 ) -> ArticleSearchDocument {
     let mut lemmas = Vec::new();
     let mut suggest = Vec::new();
@@ -669,6 +781,27 @@ pub fn build_search_document(
             .as_ref()
             .map(|b| b.all.years.clone())
             .unwrap_or_default(),
+        place_names: place_data.map(|p| p.names.clone()).unwrap_or_default(),
+        place_codes: place_data.map(|p| p.codes.clone()).unwrap_or_default(),
+        place_types: place_data.map(|p| p.types.clone()).unwrap_or_default(),
+        dialect_place_names: place_data
+            .map(|p| p.dialect_names.clone())
+            .unwrap_or_default(),
+        dialect_place_codes: place_data
+            .map(|p| p.dialect_codes.clone())
+            .unwrap_or_default(),
+        dialect_place_types: place_data
+            .map(|p| p.dialect_types.clone())
+            .unwrap_or_default(),
+        attestation_place_names: place_data
+            .map(|p| p.attestation_names.clone())
+            .unwrap_or_default(),
+        attestation_place_codes: place_data
+            .map(|p| p.attestation_codes.clone())
+            .unwrap_or_default(),
+        attestation_place_types: place_data
+            .map(|p| p.attestation_types.clone())
+            .unwrap_or_default(),
         etymology_languages,
         definition_text: definition_parts.join(" "),
         example_text: example_parts.join(" "),
@@ -714,6 +847,15 @@ pub async fn setup_indexes(client: &Client) -> Result<()> {
                 "inflection_tags",
                 "has_split_inf",
                 "dialect_places",
+                "place_names",
+                "place_codes",
+                "place_types",
+                "dialect_place_names",
+                "dialect_place_codes",
+                "dialect_place_types",
+                "attestation_place_names",
+                "attestation_place_codes",
+                "attestation_place_types",
                 "older_source_codes",
                 "older_source_authors",
                 "older_source_titles",
@@ -755,8 +897,9 @@ pub async fn setup_indexes(client: &Client) -> Result<()> {
             ])
             .with_stop_words(Vec::<String>::new())
             .with_pagination(meilisearch_sdk::settings::PaginationSetting {
-                max_total_hits: 1000,
-            });
+                max_total_hits: 500_000,
+            })
+            .with_max_values_per_facet(10_000);
 
         let task = index.set_settings(&settings).await?;
         task.wait_for_completion(client, None, Some(std::time::Duration::from_secs(600)))
@@ -787,7 +930,7 @@ pub async fn setup_indexes(client: &Client) -> Result<()> {
                 "exactness",
             ])
             .with_pagination(meilisearch_sdk::settings::PaginationSetting {
-                max_total_hits: 1000,
+                max_total_hits: 10_000,
             });
 
         let task = index.set_settings(&settings).await?;
@@ -795,6 +938,45 @@ pub async fn setup_indexes(client: &Client) -> Result<()> {
             .await?;
 
         info!("Meilisearch index '{BIBLIOGRAPHY_INDEX}' configured.");
+    }
+
+    // Configure places index.
+    {
+        info!("Configuring Meilisearch index '{PLACE_INDEX}'…");
+
+        let task = client.create_index(PLACE_INDEX, Some("id")).await?;
+        task.wait_for_completion(client, None, None).await?;
+
+        let index = client.index(PLACE_INDEX);
+
+        let settings = Settings::new()
+            .with_searchable_attributes(["place_name", "place_name_full", "place_type"])
+            .with_filterable_attributes([
+                "id",
+                "place_name",
+                "place_name_full",
+                "place_type",
+                "parent_id",
+                "municipality_nr",
+            ])
+            .with_sortable_attributes(["place_name"])
+            .with_ranking_rules([
+                "words",
+                "typo",
+                "proximity",
+                "attribute",
+                "sort",
+                "exactness",
+            ])
+            .with_pagination(meilisearch_sdk::settings::PaginationSetting {
+                max_total_hits: 10_000,
+            });
+
+        let task = index.set_settings(&settings).await?;
+        task.wait_for_completion(client, None, Some(std::time::Duration::from_secs(60)))
+            .await?;
+
+        info!("Meilisearch index '{PLACE_INDEX}' configured.");
     }
 
     Ok(())
@@ -834,6 +1016,32 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
         .map(|(id, code, author, title, year)| (id, (code, author, title, year)))
         .collect();
 
+    let place_rows: Vec<(i64, String, String, String)> =
+        sqlx::query_as("SELECT id, place_name, place_name_full, place_type FROM places")
+            .fetch_all(db)
+            .await?;
+
+    let place_map: std::collections::HashMap<i64, (String, String, String)> = place_rows
+        .into_iter()
+        .map(|(id, name, full_name, place_type)| (id, (name, full_name, place_type)))
+        .collect();
+
+    let article_place_rows: Vec<(String, i64, i64, String)> =
+        sqlx::query_as("SELECT dictionary, article_id, place_id, context FROM article_place")
+            .fetch_all(db)
+            .await?;
+
+    let mut article_place_map: std::collections::HashMap<(String, i64), (Vec<i64>, Vec<i64>)> =
+        std::collections::HashMap::new();
+    for (dict, article_id, place_id, context) in article_place_rows {
+        let entry = article_place_map.entry((dict, article_id)).or_default();
+        match context.as_str() {
+            "dialect" => entry.0.push(place_id),
+            "attestation" => entry.1.push(place_id),
+            _ => {}
+        }
+    }
+
     for dict in ["bm", "nn", "no"] {
         let idx = client.index(index_name(dict));
 
@@ -861,7 +1069,18 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
         while let Some(row) = stream.next().await {
             let (id, data) = row?;
             let bib = build_article_bibliography(&data, &bib_map);
-            batch.push(build_search_document(dict, id, &data, Some(&bib)));
+            let (dialect_ids, attestation_ids) = article_place_map
+                .get(&(dict.to_string(), id))
+                .cloned()
+                .unwrap_or_default();
+            let places = build_article_place_data_split(&dialect_ids, &attestation_ids, &place_map);
+            batch.push(build_search_document(
+                dict,
+                id,
+                &data,
+                Some(&bib),
+                Some(&places),
+            ));
 
             if batch.len() >= 5000 {
                 tasks.push(idx.add_or_replace(&batch, Some("id")).await?);
@@ -918,6 +1137,39 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
             }
 
             info!("  [bibliography] Done.");
+        }
+    }
+
+    // Re-index place entries.
+    {
+        let idx = client.index(PLACE_INDEX);
+        let rows: Vec<PlaceSearchDocument> = sqlx::query_as::<_, (i64, String, String, String, Option<i64>, Option<String>)>(
+            "SELECT id, place_name, place_name_full, place_type, parent_id, municipality_nr FROM places",
+        )
+        .fetch_all(db)
+        .await?
+        .into_iter()
+        .map(|(id, place_name, place_name_full, place_type, parent_id, municipality_nr)| {
+            PlaceSearchDocument { id, place_name, place_name_full, place_type, parent_id, municipality_nr }
+        })
+        .collect();
+
+        if rows.is_empty() {
+            info!("  [places] No entries in DB, skipping.");
+        } else {
+            info!("  [places] Re-indexing {} entries…", rows.len());
+
+            let mut tasks = Vec::new();
+            for chunk in rows.chunks(5000) {
+                tasks.push(idx.add_or_replace(chunk, Some("id")).await?);
+            }
+
+            let timeout = Some(std::time::Duration::from_secs(60));
+            for task in tasks {
+                task.wait_for_completion(client, None, timeout).await?;
+            }
+
+            info!("  [places] Done.");
         }
     }
 
@@ -1005,7 +1257,7 @@ mod tests {
             }
         });
 
-        let doc = build_search_document("bm", 55001, &data, None);
+        let doc = build_search_document("bm", 55001, &data, None, None);
 
         assert_eq!(doc.id, "bm_55001");
         assert_eq!(doc.article_id, 55001);
@@ -1076,7 +1328,7 @@ mod tests {
             "suggest": ["F", "f"]
         });
 
-        let doc = build_search_document("bm", 90000, &data, None);
+        let doc = build_search_document("bm", 90000, &data, None, None);
 
         assert_eq!(doc.lemmas, vec!["F", "f"]);
         assert_eq!(doc.suggest, vec!["F", "f"]);
@@ -1115,7 +1367,7 @@ mod tests {
             "suggest": ["velja"]
         });
 
-        let doc = build_search_document("nn", 70001, &data, None);
+        let doc = build_search_document("nn", 70001, &data, None, None);
 
         assert!(doc.has_split_inf);
         assert_eq!(doc.lemmas, vec!["velja"]);
@@ -1127,7 +1379,7 @@ mod tests {
     #[test]
     fn test_build_search_document_empty_data() {
         let data = json!({});
-        let doc = build_search_document("no", 99, &data, None);
+        let doc = build_search_document("no", 99, &data, None, None);
 
         assert_eq!(doc.id, "no_99");
         assert!(doc.lemmas.is_empty());
@@ -1262,7 +1514,7 @@ mod tests {
         );
 
         let bib = build_article_bibliography(&data, &bib_map);
-        let doc = build_search_document("no", 99001, &data, Some(&bib));
+        let doc = build_search_document("no", 99001, &data, Some(&bib), None);
 
         assert_eq!(doc.dialect_places, vec!["Nordfjell", "Vestmark"]);
         assert_eq!(doc.older_source_codes, vec!["FiktA", "FiktB"]);

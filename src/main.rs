@@ -41,7 +41,7 @@ use tracing::{error, info, warn};
 
 use crate::article_sync_service::{
     ArticleSyncService, FetchArticleJob, FetchArticleListJob, FetchBibliographyJob,
-    FetchDictionaryMetadataJob, UibDictionary,
+    FetchDictionaryMetadataJob, FetchPlaceJob, UibDictionary,
 };
 
 #[cfg(feature = "matrix_notifs")]
@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
             redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
         let fetch_bibliography_storage =
             redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
+        let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, "apalis:place");
 
         #[cfg(feature = "matrix_notifs")]
         let matrix_message_storage =
@@ -285,7 +286,8 @@ async fn main() -> Result<()> {
             .register(fetch_article_list_storage.clone())
             .register(fetch_article_storage.clone())
             .register(fetch_dict_metadata_storage.clone())
-            .register(fetch_bibliography_storage.clone());
+            .register(fetch_bibliography_storage.clone())
+            .register(fetch_place_storage.clone());
 
         #[cfg(feature = "matrix_notifs")]
         let api = api.register(matrix_message_storage.clone());
@@ -353,6 +355,7 @@ async fn main() -> Result<()> {
             fetch_article_storage: fetch_article_storage.clone(),
             fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
             fetch_bibliography_storage: fetch_bibliography_storage.clone(),
+            fetch_place_storage: fetch_place_storage.clone(),
             #[cfg(feature = "matrix_notifs")]
             matrix_message_storage: matrix_message_storage.clone(),
         };
@@ -384,6 +387,10 @@ async fn main() -> Result<()> {
             error!("Initial bibliography sync enqueue failed: {e}");
         }
 
+        if let Err(e) = sync_service.enqueue_initial_place_sync().await {
+            error!("Initial place sync enqueue failed: {e}");
+        }
+
         let svc = sync_service.clone();
         let job_tracker = JobTracker::default();
         let article_concurrency = num_workers.clamp(4, 16);
@@ -395,6 +402,7 @@ async fn main() -> Result<()> {
             "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
             "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
             "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
+            "fetch-place" => fetch_place_storage, 4, handle_fetch_place;
         );
 
         // Set up cron for daily sync at 2 AM.
@@ -507,6 +515,15 @@ async fn handle_fetch_bibliography(
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching bibliography {}", job.bibl_id));
     svc.handle_sync_bibliography(job.bibl_id).await
+}
+
+async fn handle_fetch_place(
+    job: FetchPlaceJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!("Fetching place {}", job.place_id));
+    svc.handle_sync_place(job.place_id).await
 }
 
 async fn handle_daily_sync(

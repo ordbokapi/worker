@@ -116,6 +116,12 @@ pub struct FetchBibliographyJob {
     pub bibl_id: i64,
 }
 
+/// Fetch a single place entry from the word bank API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchPlaceJob {
+    pub place_id: i64,
+}
+
 /// Main service that handles fetch and store logic.
 #[derive(Clone)]
 pub struct ArticleSyncService {
@@ -127,6 +133,7 @@ pub struct ArticleSyncService {
     pub fetch_article_storage: RedisStorage<FetchArticleJob>,
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
     pub fetch_bibliography_storage: RedisStorage<FetchBibliographyJob>,
+    pub fetch_place_storage: RedisStorage<FetchPlaceJob>,
     #[cfg(feature = "matrix_notifs")]
     pub matrix_message_storage: RedisStorage<SendMatrixMessageJob>,
 }
@@ -175,6 +182,21 @@ impl ArticleSyncService {
     /// Mark a bibliography entry as queued.
     async fn try_mark_bibl_queued(&self, bibl_id: i64) -> Result<bool> {
         let key = format!("ordbokapi:bibl-queued:{bibl_id}");
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(Self::DEDUPE_TTL)
+            .query_async(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Redis SET NX EX failed: {e}"))?;
+        Ok(result.is_some())
+    }
+
+    /// Mark a place entry as queued.
+    async fn try_mark_place_queued(&self, place_id: i64) -> Result<bool> {
+        let key = format!("ordbokapi:place-queued:{place_id}");
         let result: Option<String> = redis::cmd("SET")
             .arg(&key)
             .arg(1)
@@ -442,6 +464,7 @@ impl ArticleSyncService {
             .await?;
 
         self.enqueue_bibliography_for_article(&article_json).await?;
+        self.enqueue_places_for_article(dict, &article_json).await?;
 
         info!(
             "[{:?}] Article {} ({}) stored and indexed",
@@ -650,6 +673,9 @@ impl ArticleSyncService {
     ) -> Result<()> {
         let dict_str = dict.as_str();
         let bibl_ids: Vec<i64> = Self::extract_bibl_ids(article_data).into_iter().collect();
+        let (dialect_place_ids, attestation_place_ids) = Self::extract_place_ids(article_data);
+        let dialect_ids_vec: Vec<i64> = dialect_place_ids.into_iter().collect();
+        let attestation_ids_vec: Vec<i64> = attestation_place_ids.into_iter().collect();
 
         let mut tx = self.db.begin().await?;
 
@@ -687,6 +713,38 @@ impl ArticleSyncService {
             .await?;
         }
 
+        sqlx::query("DELETE FROM article_place WHERE dictionary = $1 AND article_id = $2")
+            .bind(dict_str)
+            .bind(article_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if !dialect_ids_vec.is_empty() {
+            sqlx::query(
+                "INSERT INTO article_place (dictionary, article_id, place_id, context) \
+                 SELECT $1, $2, unnest($3::bigint[]), 'dialect' \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(dict_str)
+            .bind(article_id)
+            .bind(&dialect_ids_vec)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if !attestation_ids_vec.is_empty() {
+            sqlx::query(
+                "INSERT INTO article_place (dictionary, article_id, place_id, context) \
+                 SELECT $1, $2, unnest($3::bigint[]), 'attestation' \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(dict_str)
+            .bind(article_id)
+            .bind(&attestation_ids_vec)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
 
         Ok(())
@@ -700,7 +758,14 @@ impl ArticleSyncService {
         article_data: &Value,
     ) -> Result<()> {
         let bib = self.load_article_bibliography(article_data).await?;
-        let doc = meili::build_search_document(dict.as_str(), article_id, article_data, Some(&bib));
+        let places = self.load_article_place_data(dict, article_id).await?;
+        let doc = meili::build_search_document(
+            dict.as_str(),
+            article_id,
+            article_data,
+            Some(&bib),
+            Some(&places),
+        );
         let idx = self.meili.index(meili::index_name(dict.as_str()));
 
         idx.add_or_replace(&[doc], Some("id"))
@@ -708,6 +773,61 @@ impl ArticleSyncService {
             .map_err(|e| anyhow!("Failed to index article in Meilisearch: {e}"))?;
 
         Ok(())
+    }
+
+    /// Load place metadata for an article, split by context.
+    async fn load_article_place_data(
+        &self,
+        dict: UibDictionary,
+        article_id: i64,
+    ) -> Result<meili::ArticlePlaceData> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT place_id, context FROM article_place WHERE dictionary = $1 AND article_id = $2",
+        )
+        .bind(dict.as_str())
+        .bind(article_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(meili::ArticlePlaceData::default());
+        }
+
+        let mut dialect_ids = Vec::new();
+        let mut attestation_ids = Vec::new();
+        let mut all_ids = Vec::new();
+        for (pid, ctx) in &rows {
+            all_ids.push(*pid);
+            match ctx.as_str() {
+                "dialect" => dialect_ids.push(*pid),
+                "attestation" => attestation_ids.push(*pid),
+                _ => {}
+            }
+        }
+
+        let unique_ids: Vec<i64> = all_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<i64>>()
+            .into_iter()
+            .collect();
+        let place_rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, place_name, place_name_full, place_type FROM places WHERE id = ANY($1)",
+        )
+        .bind(&unique_ids)
+        .fetch_all(&self.db)
+        .await?;
+
+        let place_map: std::collections::HashMap<i64, (String, String, String)> = place_rows
+            .into_iter()
+            .map(|(id, name, full_name, place_type)| (id, (name, full_name, place_type)))
+            .collect();
+
+        Ok(meili::build_article_place_data_split(
+            &dialect_ids,
+            &attestation_ids,
+            &place_map,
+        ))
     }
 
     /// Load bibliography metadata for an article.
@@ -957,6 +1077,34 @@ impl ArticleSyncService {
         Ok(())
     }
 
+    /// Re-index all articles that reference a given place ID.
+    async fn reindex_articles_for_place(&self, place_id: i64) -> Result<()> {
+        let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+            "SELECT a.dictionary, a.id, a.data FROM articles a \
+             INNER JOIN article_place ap \
+             ON a.dictionary = ap.dictionary AND a.id = ap.article_id \
+             WHERE ap.place_id = $1",
+        )
+        .bind(place_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        info!("Re-indexing {} articles for place {place_id}", rows.len());
+
+        for (dict_str, article_id, data) in &rows {
+            let dict = Self::parse_dict(dict_str)?;
+            if let Err(e) = self.index_article(dict, *article_id, data).await {
+                warn!("Failed to re-index article {article_id} for place {place_id}: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Fetch a single bibliography entry.
     async fn fetch_bibliography_entry(&self, api_key: &str, bibl_id: i64) -> Result<Value> {
         let url = format!("https://clarino.uib.no/ordbank-api-prod/bibl/{bibl_id}");
@@ -1086,6 +1234,282 @@ impl ArticleSyncService {
             }
             _ => {}
         }
+    }
+
+    /// Extract all place IDs from an article.
+    fn extract_place_ids(article: &Value) -> (HashSet<i64>, HashSet<i64>) {
+        let dialect_ids = Self::extract_dialect_place_ids(article);
+        let attestation_ids = Self::extract_attestation_place_ids(article);
+        (dialect_ids, attestation_ids)
+    }
+
+    /// Extract place IDs from dialect sources.
+    fn extract_dialect_place_ids(article: &Value) -> HashSet<i64> {
+        article
+            .pointer("/body/dialect")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .flat_map(|d| {
+                d.get("subcats")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|sc| {
+                sc.get("forms")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|f| {
+                f.get("sources")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|s| s.get("place_id").and_then(|v| v.as_i64()))
+            .collect()
+    }
+
+    /// Extract place IDs from attestation place_refs.
+    fn extract_attestation_place_ids(article: &Value) -> HashSet<i64> {
+        article
+            .pointer("/body/definitions")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .flat_map(|def| {
+                def.get("elements")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|elem| {
+                elem.get("place_refs")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|pr| pr.get("place")?.get("place_id")?.as_i64())
+            .collect()
+    }
+
+    /// Enqueue place fetch jobs for any place IDs in an article that are not
+    /// already present in the database.
+    async fn enqueue_places_for_article(&self, dict: UibDictionary, article: &Value) -> Result<()> {
+        if dict != UibDictionary::NorskOrdbok {
+            return Ok(());
+        }
+
+        let (dialect_ids, attestation_ids) = Self::extract_place_ids(article);
+        let place_ids: HashSet<i64> = dialect_ids.union(&attestation_ids).copied().collect();
+        if place_ids.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_place_ids(&place_ids).await
+    }
+
+    /// Enqueue place fetch jobs for IDs not yet in the database.
+    pub async fn enqueue_place_ids(&self, place_ids: &HashSet<i64>) -> Result<()> {
+        if self.clarino_api_key.is_none() {
+            debug!("No CLARINO_API_KEY set, skipping place enqueue.");
+            return Ok(());
+        }
+
+        let ids_vec: Vec<i64> = place_ids.iter().copied().collect();
+        let existing: Vec<(i64,)> = sqlx::query_as("SELECT id FROM places WHERE id = ANY($1)")
+            .bind(&ids_vec)
+            .fetch_all(&self.db)
+            .await?;
+
+        let existing_set: HashSet<i64> = existing.into_iter().map(|(id,)| id).collect();
+        let missing: Vec<i64> = ids_vec
+            .into_iter()
+            .filter(|id| !existing_set.contains(id))
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let mut storage = self.fetch_place_storage.clone();
+        let mut enqueued = 0usize;
+        for place_id in missing {
+            if self.try_mark_place_queued(place_id).await? {
+                storage.push(FetchPlaceJob { place_id }).await?;
+                enqueued += 1;
+            }
+        }
+
+        if enqueued > 0 {
+            info!("Enqueued {enqueued} place fetch jobs");
+        }
+
+        Ok(())
+    }
+
+    /// Enqueue place jobs for all articles.
+    pub async fn enqueue_initial_place_sync(&self) -> Result<()> {
+        if self.clarino_api_key.is_none() {
+            info!("No CLARINO_API_KEY set, skipping initial place sync.");
+            return Ok(());
+        }
+
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT DISTINCT place_id FROM article_place")
+            .fetch_all(&self.db)
+            .await?;
+
+        let all_place_ids: HashSet<i64> = rows.into_iter().map(|(id,)| id).collect();
+
+        if all_place_ids.is_empty() {
+            info!("No place IDs found in articles.");
+            return Ok(());
+        }
+
+        info!(
+            "Found {} unique place IDs across all articles, enqueueing missing entries…",
+            all_place_ids.len()
+        );
+
+        self.enqueue_place_ids(&all_place_ids).await?;
+
+        info!("Initial place sync jobs enqueued.");
+        Ok(())
+    }
+
+    /// Handle a single place fetch job.
+    pub async fn handle_sync_place(&self, place_id: i64) -> Result<()> {
+        let api_key = self
+            .clarino_api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("CLARINO_API_KEY not set"))?;
+
+        let entry = self.fetch_place_entry(api_key, place_id).await?;
+        self.store_place_entry(place_id, &entry).await?;
+        self.index_place_entry(place_id, &entry).await?;
+
+        let child_ids = Self::extract_child_place_ids(&entry);
+        if !child_ids.is_empty() {
+            self.enqueue_place_ids(&child_ids).await?;
+        }
+
+        self.reindex_articles_for_place(place_id).await?;
+
+        info!("Place entry {place_id} synced");
+        Ok(())
+    }
+
+    /// Extract children place IDs from the place API response.
+    fn extract_child_place_ids(entry: &Value) -> HashSet<i64> {
+        let mut ids = HashSet::new();
+        if let Some(children) = entry.get("child_places").and_then(|v| v.as_array()) {
+            for child in children {
+                if let Some(pid) = child.get("place_id").and_then(|v| v.as_i64()) {
+                    ids.insert(pid);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Fetch a single place entry.
+    async fn fetch_place_entry(&self, api_key: &str, place_id: i64) -> Result<Value> {
+        let url = format!("https://clarino.uib.no/ordbank-api-prod/place/{place_id}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        let data: Value = resp.json().await?;
+        let entry = data
+            .get(place_id.to_string())
+            .cloned()
+            .ok_or_else(|| anyhow!("Empty response for place {place_id}"))?;
+        Ok(entry)
+    }
+
+    /// Index a place entry in Meilisearch.
+    async fn index_place_entry(&self, place_id: i64, entry: &Value) -> Result<()> {
+        let doc = meili::PlaceSearchDocument {
+            id: place_id,
+            place_name: entry
+                .get("place_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            place_name_full: entry
+                .get("place_name_full")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            place_type: entry
+                .get("place_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            parent_id: entry.get("parent_id").and_then(|v| v.as_i64()),
+            municipality_nr: entry
+                .get("municipality_nr")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+
+        let idx = self.meili.index(meili::PLACE_INDEX);
+        idx.add_or_replace(&[doc], Some("id"))
+            .await
+            .map_err(|e| anyhow!("Failed to index place in Meilisearch: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Store a place entry in PostgreSQL.
+    async fn store_place_entry(&self, place_id: i64, entry: &Value) -> Result<()> {
+        let place_name = entry
+            .get("place_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let place_name_full = entry
+            .get("place_name_full")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let place_type = entry
+            .get("place_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let parent_id = entry.get("parent_id").and_then(|v| v.as_i64());
+        let place_order = entry
+            .get("place_order")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let municipality_nr = entry
+            .get("municipality_nr")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let weight_threshold = entry
+            .get("weight_threshold")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+
+        sqlx::query(
+            "INSERT INTO places (id, place_name, place_name_full, place_type, parent_id, place_order, municipality_nr, weight_threshold, fetched_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+             ON CONFLICT (id) DO UPDATE
+             SET place_name = $2, place_name_full = $3, place_type = $4, parent_id = $5, place_order = $6, municipality_nr = $7, weight_threshold = $8, fetched_at = now()",
+        )
+        .bind(place_id)
+        .bind(place_name)
+        .bind(place_name_full)
+        .bind(place_type)
+        .bind(parent_id)
+        .bind(place_order)
+        .bind(municipality_nr)
+        .bind(weight_threshold)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
     }
 }
 
