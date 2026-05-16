@@ -153,21 +153,23 @@ impl ArticleSyncService {
         Ok(result.is_some())
     }
 
-    /// Mark articles as queued.
-    async fn mark_articles_queued(&self, dict: &str, article_ids: &[i64]) -> Result<()> {
+    /// Try to mark articles as queued.
+    async fn try_mark_articles_queued(&self, dict: &str, article_ids: &[i64]) -> Result<Vec<bool>> {
         let mut pipe = redis::pipe();
         for &id in article_ids {
             let key = format!("ordbokapi:article-queued:{dict}:{id}");
             pipe.cmd("SET")
                 .arg(key)
                 .arg(1)
+                .arg("NX")
                 .arg("EX")
                 .arg(Self::DEDUPE_TTL);
         }
-        pipe.query_async::<()>(&mut self.redis_conn.clone())
+        let results: Vec<Option<String>> = pipe
+            .query_async(&mut self.redis_conn.clone())
             .await
-            .map_err(|e| anyhow!("Redis pipeline SET EX failed: {e}"))?;
-        Ok(())
+            .map_err(|e| anyhow!("Redis pipeline SET NX EX failed: {e}"))?;
+        Ok(results.iter().map(|r| r.is_some()).collect())
     }
 
     /// Mark a bibliography entry as queued.
@@ -205,6 +207,20 @@ impl ArticleSyncService {
 
     /// Fire off a job to do the full article-list sync for a dictionary.
     pub async fn enqueue_sync_articles(&self, dict: UibDictionary) -> Result<()> {
+        let key = format!("ordbokapi:article-list-queued:{}", dict.as_str());
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(Self::DEDUPE_TTL)
+            .query_async(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Redis SET NX EX failed: {e}"))?;
+        if result.is_none() {
+            info!("[{:?}] FetchArticleListJob already queued, skipping", dict);
+            return Ok(());
+        }
         let mut storage = self.fetch_article_list_storage.clone();
         storage
             .push(FetchArticleListJob {
@@ -339,26 +355,36 @@ impl ArticleSyncService {
             );
         }
 
-        let total = to_enqueue.len();
+        let candidates = to_enqueue.len();
+        let mut enqueued = 0usize;
 
         // Perform a single pipelined batch enqueue
         if !to_enqueue.is_empty() {
             // Mark all articles as queued so queue_related_articles won't
             // re-enqueue them.
             let article_ids: Vec<i64> = to_enqueue.iter().map(|j| j.article_id).collect();
-            self.mark_articles_queued(dict.as_str(), &article_ids)
+            let newly_marked = self
+                .try_mark_articles_queued(dict.as_str(), &article_ids)
                 .await?;
 
             let mut storage = self.fetch_article_storage.clone();
-            for job in to_enqueue {
-                storage
-                    .push(job)
-                    .await
-                    .map_err(|e| anyhow!("Failed to enqueue FetchArticle: {e}"))?;
+            for (job, is_new) in to_enqueue.into_iter().zip(newly_marked.iter()) {
+                if *is_new {
+                    storage
+                        .push(job)
+                        .await
+                        .map_err(|e| anyhow!("Failed to enqueue FetchArticle: {e}"))?;
+                    enqueued += 1;
+                }
             }
         }
 
-        info!("[{:?}] Enqueued {} article fetch jobs", dict, total);
+        info!(
+            "[{:?}] Enqueued {} article fetch jobs, {} already queued.",
+            dict,
+            enqueued,
+            candidates - enqueued
+        );
 
         #[cfg(feature = "matrix_notifs")]
         {
@@ -498,20 +524,23 @@ impl ArticleSyncService {
             .await?;
 
             if !has_articles.0 && already_queued.is_none() {
-                warn!(
-                    "[{:?}] No articles in DB, queueing initial article fetch.",
-                    dict
-                );
-                self.enqueue_sync_articles(*dict).await?;
-
-                sqlx::query(
+                let inserted: Option<(String,)> = sqlx::query_as(
                     "INSERT INTO sync_state (dictionary, key, value)
                      VALUES ($1, 'initial_queue_done', '1')
-                     ON CONFLICT (dictionary, key) DO NOTHING",
+                     ON CONFLICT (dictionary, key) DO NOTHING
+                     RETURNING value",
                 )
                 .bind(dict_str)
-                .execute(&self.db)
+                .fetch_optional(&self.db)
                 .await?;
+
+                if inserted.is_some() {
+                    warn!(
+                        "[{:?}] No articles in DB, queueing initial article fetch.",
+                        dict
+                    );
+                    self.enqueue_sync_articles(*dict).await?;
+                }
             }
 
             // Check if we have dictionary metadata
