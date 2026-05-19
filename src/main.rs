@@ -22,6 +22,7 @@ mod matrix_notify_service;
 mod meili;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::{Error, Result};
 use apalis::prelude::*;
@@ -40,8 +41,9 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info, warn};
 
 use crate::article_sync_service::{
-    ArticleSyncService, FetchArticleJob, FetchArticleListJob, FetchBibliographyJob,
-    FetchDictionaryMetadataJob, FetchPlaceJob, UibDictionary,
+    ArticleSyncService, BackfillInlineRefsJob, DrainPendingReindexJob, FetchArticleJob,
+    FetchArticleListJob, FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob,
+    ResolveInlineCodeJob, UibDictionary,
 };
 
 #[cfg(feature = "matrix_notifs")]
@@ -265,6 +267,12 @@ async fn main() -> Result<()> {
         let fetch_bibliography_storage =
             redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
         let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, "apalis:place");
+        let backfill_inline_refs_storage =
+            redis_storage::<BackfillInlineRefsJob>(&redis_conn, "apalis:backfill-inline-refs");
+        let resolve_inline_code_storage =
+            redis_storage::<ResolveInlineCodeJob>(&redis_conn, "apalis:resolve-inline-code");
+        let drain_pending_reindex_storage =
+            redis_storage::<DrainPendingReindexJob>(&redis_conn, "apalis:drain-pending-reindex");
 
         #[cfg(feature = "matrix_notifs")]
         let matrix_message_storage =
@@ -356,6 +364,10 @@ async fn main() -> Result<()> {
             fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
             fetch_bibliography_storage: fetch_bibliography_storage.clone(),
             fetch_place_storage: fetch_place_storage.clone(),
+            backfill_inline_refs_storage: backfill_inline_refs_storage.clone(),
+            resolve_inline_code_storage: resolve_inline_code_storage.clone(),
+            inline_refs_backfill_count: Arc::new(AtomicU64::new(0)),
+            drain_pending_reindex_storage: drain_pending_reindex_storage.clone(),
             #[cfg(feature = "matrix_notifs")]
             matrix_message_storage: matrix_message_storage.clone(),
         };
@@ -387,6 +399,10 @@ async fn main() -> Result<()> {
             error!("Initial bibliography sync enqueue failed: {e}");
         }
 
+        if let Err(e) = sync_service.enqueue_inline_refs_backfill().await {
+            error!("Inline reference backfill enqueue failed: {e}");
+        }
+
         if let Err(e) = sync_service.enqueue_initial_place_sync().await {
             error!("Initial place sync enqueue failed: {e}");
         }
@@ -403,6 +419,9 @@ async fn main() -> Result<()> {
             "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
             "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
             "fetch-place" => fetch_place_storage, 4, handle_fetch_place;
+            "backfill-inline-refs" => backfill_inline_refs_storage, 4, handle_backfill_inline_refs;
+            "resolve-inline-code" => resolve_inline_code_storage, 2, handle_resolve_inline_code;
+            "drain-pending-reindex" => drain_pending_reindex_storage, 1, handle_drain_pending_reindex;
         );
 
         // Set up cron for daily sync at 2 AM.
@@ -524,6 +543,36 @@ async fn handle_fetch_place(
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching place {}", job.place_id));
     svc.handle_sync_place(job.place_id).await
+}
+
+async fn handle_backfill_inline_refs(
+    job: BackfillInlineRefsJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!(
+        "Backfill inline refs for {} articles",
+        job.article_ids.len()
+    ));
+    svc.handle_backfill_inline_refs(&job.article_ids).await
+}
+
+async fn handle_resolve_inline_code(
+    job: ResolveInlineCodeJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!("Resolve inline code '{}'", job.code));
+    svc.handle_resolve_inline_code(&job.code).await
+}
+
+async fn handle_drain_pending_reindex(
+    _job: DrainPendingReindexJob,
+    svc: Data<ArticleSyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track("Drain pending reindex".to_string());
+    svc.handle_drain_pending_reindex().await
 }
 
 async fn handle_daily_sync(

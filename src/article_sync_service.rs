@@ -20,11 +20,16 @@ use anyhow::{Result, anyhow};
 use apalis::prelude::*;
 use apalis_redis::{ConnectionManager, RedisStorage};
 use clap::ValueEnum;
+use futures::StreamExt;
 use meilisearch_sdk::client::Client as MeiliClient;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::meili;
@@ -122,6 +127,22 @@ pub struct FetchPlaceJob {
     pub place_id: i64,
 }
 
+/// Backfill inline refs for one or more articles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillInlineRefsJob {
+    pub article_ids: Vec<i64>,
+}
+
+/// Attempt to resolve an unresolved inline code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveInlineCodeJob {
+    pub code: String,
+}
+
+/// Drain the pending reindex set and batch index all accumulated articles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainPendingReindexJob;
+
 /// Main service that handles fetch and store logic.
 #[derive(Clone)]
 pub struct ArticleSyncService {
@@ -134,12 +155,17 @@ pub struct ArticleSyncService {
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
     pub fetch_bibliography_storage: RedisStorage<FetchBibliographyJob>,
     pub fetch_place_storage: RedisStorage<FetchPlaceJob>,
+    pub backfill_inline_refs_storage: RedisStorage<BackfillInlineRefsJob>,
+    pub resolve_inline_code_storage: RedisStorage<ResolveInlineCodeJob>,
+    pub inline_refs_backfill_count: Arc<AtomicU64>,
+    pub drain_pending_reindex_storage: RedisStorage<DrainPendingReindexJob>,
     #[cfg(feature = "matrix_notifs")]
     pub matrix_message_storage: RedisStorage<SendMatrixMessageJob>,
 }
 
 impl ArticleSyncService {
     const DEDUPE_TTL: u64 = 24 * 60 * 60;
+    const PENDING_REINDEX_KEY: &str = "ordbokapi:pending-reindex";
 
     fn parse_dict(s: &str) -> Result<UibDictionary> {
         UibDictionary::from_str(s, false).map_err(|e| anyhow!("{e}"))
@@ -676,6 +702,7 @@ impl ArticleSyncService {
         let (dialect_place_ids, attestation_place_ids) = Self::extract_place_ids(article_data);
         let dialect_ids_vec: Vec<i64> = dialect_place_ids.into_iter().collect();
         let attestation_ids_vec: Vec<i64> = attestation_place_ids.into_iter().collect();
+        let inline_refs = Self::extract_inline_refs(article_data);
 
         let mut tx = self.db.begin().await?;
 
@@ -713,6 +740,22 @@ impl ArticleSyncService {
             .await?;
         }
 
+        let (inline_resolved_bibl_ids, unresolved_codes) = self
+            .store_inline_refs(&mut tx, dict_str, article_id, &inline_refs)
+            .await?;
+        if !inline_resolved_bibl_ids.is_empty() {
+            sqlx::query(
+                "INSERT INTO article_bibliography (dictionary, article_id, bibl_id) \
+                 SELECT $1, $2, unnest($3::bigint[]) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(dict_str)
+            .bind(article_id)
+            .bind(&inline_resolved_bibl_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         sqlx::query("DELETE FROM article_place WHERE dictionary = $1 AND article_id = $2")
             .bind(dict_str)
             .bind(article_id)
@@ -746,6 +789,10 @@ impl ArticleSyncService {
         }
 
         tx.commit().await?;
+
+        if !unresolved_codes.is_empty() {
+            self.enqueue_resolve_inline_codes(&unresolved_codes).await?;
+        }
 
         Ok(())
     }
@@ -1027,6 +1074,299 @@ impl ArticleSyncService {
         Ok(())
     }
 
+    /// Enqueue backfill jobs for inline bibliography parse data for existing
+    /// Norsk Ordbok articles.
+    pub async fn enqueue_inline_refs_backfill(&self) -> Result<()> {
+        let already_done: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM sync_state WHERE dictionary = 'no' AND key = 'inline_refs_backfill_enqueued'",
+        )
+        .fetch_optional(&self.db)
+        .await?;
+
+        if already_done.is_some() {
+            debug!("Inline reference backfill already enqueued, skipping.");
+            return Ok(());
+        }
+
+        let has_articles: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM articles WHERE dictionary = 'no')")
+                .fetch_one(&self.db)
+                .await?;
+
+        if !has_articles.0 {
+            return Ok(());
+        }
+
+        info!("Enqueueing inline reference backfill jobs for Norsk Ordbok articles…");
+
+        let mut stream = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM articles WHERE dictionary = 'no' ORDER BY id",
+        )
+        .fetch(&self.db);
+
+        let mut batch: Vec<i64> = Vec::with_capacity(1000);
+        let mut count = 0usize;
+
+        while let Some(row) = stream.next().await {
+            let (article_id,) = row?;
+            batch.push(article_id);
+
+            if batch.len() >= 1000 {
+                self.push_backfill_batch(&batch).await?;
+                count += batch.len();
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() {
+            count += batch.len();
+            self.push_backfill_batch(&batch).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO sync_state (dictionary, key, value) \
+             VALUES ('no', 'inline_refs_backfill_enqueued', '1') \
+             ON CONFLICT (dictionary, key) DO NOTHING",
+        )
+        .execute(&self.db)
+        .await?;
+
+        info!("Enqueued {count} inline reference backfill jobs.");
+
+        Ok(())
+    }
+
+    async fn push_backfill_batch(&self, ids: &[i64]) -> Result<()> {
+        let mut storage = self.backfill_inline_refs_storage.clone();
+        storage
+            .push(BackfillInlineRefsJob {
+                article_ids: ids.to_vec(),
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to enqueue backfill batch: {e}"))?;
+        Ok(())
+    }
+
+    /// Enqueue resolve jobs for unresolved inline codes.
+    async fn enqueue_resolve_inline_codes(&self, codes: &[String]) -> Result<()> {
+        let mut storage = self.resolve_inline_code_storage.clone();
+        for code in codes {
+            let key = format!("ordbokapi:resolve-code-queued:{code}");
+            let result: Option<String> = redis::cmd("SET")
+                .arg(&key)
+                .arg("1")
+                .arg("NX")
+                .arg("EX")
+                .arg(Self::DEDUPE_TTL)
+                .query_async(&mut self.redis_conn.clone())
+                .await?;
+
+            if result.is_some() {
+                storage
+                    .push(ResolveInlineCodeJob { code: code.clone() })
+                    .await
+                    .map_err(|e| anyhow!("Failed to enqueue resolve job: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle an inline reference backfill job for one or more articles.
+    pub async fn handle_backfill_inline_refs(&self, article_ids: &[i64]) -> Result<()> {
+        let rows: Vec<(i64, Value)> = sqlx::query_as(
+            "SELECT id, data FROM articles WHERE dictionary = 'no' AND id = ANY($1)",
+        )
+        .bind(article_ids)
+        .fetch_all(&self.db)
+        .await?;
+
+        let mut all_unresolved: HashSet<String> = HashSet::new();
+        let mut tx = self.db.begin().await?;
+
+        for (article_id, data) in &rows {
+            let refs = Self::extract_inline_refs(data);
+            if refs.is_empty() {
+                continue;
+            }
+
+            let (resolved_ids, unresolved_codes) = self
+                .store_inline_refs(&mut tx, "no", *article_id, &refs)
+                .await?;
+
+            if !resolved_ids.is_empty() {
+                sqlx::query(
+                    "INSERT INTO article_bibliography (dictionary, article_id, bibl_id) \
+                     SELECT 'no', $1, unnest($2::bigint[]) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(article_id)
+                .bind(&resolved_ids)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            all_unresolved.extend(unresolved_codes);
+        }
+
+        tx.commit().await?;
+
+        if !all_unresolved.is_empty() {
+            let codes: Vec<String> = all_unresolved.into_iter().collect();
+            self.enqueue_resolve_inline_codes(&codes).await?;
+        }
+
+        let count = self
+            .inline_refs_backfill_count
+            .fetch_add(article_ids.len() as u64, Ordering::Relaxed)
+            + article_ids.len() as u64;
+        self.log_backfill_progress(count);
+
+        Ok(())
+    }
+
+    fn log_backfill_progress(&self, count: u64) {
+        if count.is_multiple_of(5000) {
+            info!("{count} articles backfilled with inline reference data.");
+        }
+    }
+
+    /// Attempt to resolve an unresolved inline code.
+    pub async fn handle_resolve_inline_code(&self, code: &str) -> Result<()> {
+        let api_key = match self.clarino_api_key.as_deref() {
+            Some(k) => k,
+            None => {
+                debug!("No CLARINO_API_KEY set, cannot resolve inline code '{code}'.");
+                return Ok(());
+            }
+        };
+
+        let still_unresolved: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM inline_ref_parse WHERE code = $1 AND ref_type IS NULL LIMIT 1",
+        )
+        .bind(code)
+        .fetch_optional(&self.db)
+        .await?;
+
+        if still_unresolved.is_none() {
+            return Ok(());
+        }
+
+        if let Ok(bibl_entries) = self.fetch_bibl_by_code(api_key, code).await
+            && let Some(entry) = bibl_entries.first()
+            && let Some(bibl_id) = entry.get("bibl_id").and_then(|v| v.as_i64())
+        {
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM bibliography WHERE id = $1")
+                    .bind(bibl_id)
+                    .fetch_optional(&self.db)
+                    .await?;
+
+            if exists.is_none() {
+                self.store_bibliography_entry(bibl_id, entry).await?;
+                self.index_bibliography_entry(bibl_id, entry).await?;
+            }
+
+            self.resolve_inline_ref_as_bibl(bibl_id, code).await?;
+            info!("Resolved inline code {code} as bibliography ID {bibl_id}.");
+            return Ok(());
+        }
+
+        let place_name = if let Some(stripped) = code.strip_suffix('M') {
+            stripped
+        } else {
+            code
+        };
+
+        if let Ok(Some((place_id, entry))) = self.fetch_place_by_name(api_key, place_name).await {
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM places WHERE id = $1")
+                .bind(place_id)
+                .fetch_optional(&self.db)
+                .await?;
+
+            if exists.is_none() {
+                self.store_place_entry(place_id, &entry).await?;
+                self.index_place_entry(place_id, &entry).await?;
+
+                let child_ids = Self::extract_child_place_ids(&entry);
+                if !child_ids.is_empty() {
+                    self.enqueue_place_ids(&child_ids).await?;
+                }
+            }
+
+            self.resolve_inline_place_by_name(place_id, place_name)
+                .await?;
+            info!("Resolved inline code {code} as place {place_name}, ID {place_id}.");
+            return Ok(());
+        }
+
+        if place_name != code
+            && let Ok(Some((place_id, entry))) = self.fetch_place_by_name(api_key, code).await
+        {
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM places WHERE id = $1")
+                .bind(place_id)
+                .fetch_optional(&self.db)
+                .await?;
+
+            if exists.is_none() {
+                self.store_place_entry(place_id, &entry).await?;
+                self.index_place_entry(place_id, &entry).await?;
+
+                let child_ids = Self::extract_child_place_ids(&entry);
+                if !child_ids.is_empty() {
+                    self.enqueue_place_ids(&child_ids).await?;
+                }
+            }
+
+            self.resolve_inline_place_by_name(place_id, code).await?;
+            info!("Resolved inline code '{code}' as place (place_id {place_id}).");
+            return Ok(());
+        }
+
+        debug!("Could not resolve inline code '{code}' as bibliography or place.");
+        Ok(())
+    }
+
+    /// Fetch bibliography entries by code.
+    async fn fetch_bibl_by_code(&self, api_key: &str, code: &str) -> Result<Vec<Value>> {
+        let encoded = urlencoding::encode(code);
+        let url = format!("https://clarino.uib.no/ordbank-api-prod/bibl?code={encoded}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        let data: Vec<Value> = resp.json().await?;
+        Ok(data)
+    }
+
+    /// Fetch places by name.
+    async fn fetch_place_by_name(&self, api_key: &str, name: &str) -> Result<Option<(i64, Value)>> {
+        let encoded = urlencoding::encode(name);
+        let url = format!("https://clarino.uib.no/ordbank-api-prod/place?place_name={encoded}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("x-api-key", api_key)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let resp = resp.error_for_status()?;
+        let data: Value = resp.json().await?;
+
+        if let Some(obj) = data.as_object()
+            && let Some((id_str, entry)) = obj.iter().next()
+            && let Ok(place_id) = id_str.parse::<i64>()
+        {
+            return Ok(Some((place_id, entry.clone())));
+        }
+
+        Ok(None)
+    }
+
     /// Handle a single bibliography fetch job.
     pub async fn handle_sync_bibliography(&self, bibl_id: i64) -> Result<()> {
         let api_key = self
@@ -1037,6 +1377,12 @@ impl ArticleSyncService {
         let entry = self.fetch_bibliography_entry(api_key, bibl_id).await?;
         self.store_bibliography_entry(bibl_id, &entry).await?;
         self.index_bibliography_entry(bibl_id, &entry).await?;
+
+        // Resolve any pending inline refs that match this entry's code.
+        let code = entry.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        if !code.is_empty() {
+            self.resolve_inline_ref_as_bibl(bibl_id, code).await?;
+        }
 
         // Re-index articles that reference this bibliography ID so their
         // bibliography fields are up to date.
@@ -1077,30 +1423,231 @@ impl ArticleSyncService {
         Ok(())
     }
 
-    /// Re-index all articles that reference a given place ID.
-    async fn reindex_articles_for_place(&self, place_id: i64) -> Result<()> {
-        let rows: Vec<(String, i64, Value)> = sqlx::query_as(
-            "SELECT a.dictionary, a.id, a.data FROM articles a \
-             INNER JOIN article_place ap \
-             ON a.dictionary = ap.dictionary AND a.id = ap.article_id \
-             WHERE ap.place_id = $1",
-        )
-        .bind(place_id)
-        .fetch_all(&self.db)
-        .await?;
+    /// Mark articles affected by a place for deferred batch reindex.
+    async fn mark_articles_for_reindex(&self, place_id: i64) -> Result<()> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT dictionary, article_id FROM article_place WHERE place_id = $1")
+                .bind(place_id)
+                .fetch_all(&self.db)
+                .await?;
 
         if rows.is_empty() {
             return Ok(());
         }
 
-        info!("Re-indexing {} articles for place {place_id}", rows.len());
+        let members: Vec<String> = rows
+            .iter()
+            .map(|(dict, id)| format!("{dict}:{id}"))
+            .collect();
 
-        for (dict_str, article_id, data) in &rows {
-            let dict = Self::parse_dict(dict_str)?;
-            if let Err(e) = self.index_article(dict, *article_id, data).await {
-                warn!("Failed to re-index article {article_id} for place {place_id}: {e}");
+        redis::cmd("SADD")
+            .arg(Self::PENDING_REINDEX_KEY)
+            .arg(&members)
+            .query_async::<i64>(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Failed to SADD pending reindex: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Schedule a drain job if one isn't already queued.
+    async fn schedule_drain_reindex(&self) -> Result<()> {
+        let key = "ordbokapi:drain-reindex-queued";
+        let result: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(300u64)
+            .query_async(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Redis SET NX failed: {e}"))?;
+
+        if result.is_some() {
+            let mut storage = self.drain_pending_reindex_storage.clone();
+            storage
+                .push(DrainPendingReindexJob)
+                .await
+                .map_err(|e| anyhow!("Failed to enqueue DrainPendingReindex: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Batch reindex articles that have pending place updates.
+    pub async fn handle_drain_pending_reindex(&self) -> Result<()> {
+        let place_queue_active = self
+            .fetch_place_storage
+            .clone()
+            .fetch_by_queue()
+            .await
+            .map(|stats| {
+                stats
+                    .iter()
+                    .filter(|st| st.title == "PENDING_JOBS" || st.title == "RUNNING_JOBS")
+                    .filter_map(|st| st.value.parse::<i64>().ok())
+                    .sum::<i64>()
+            })
+            .unwrap_or(0);
+
+        if place_queue_active > 0 {
+            info!("Place queue still has {place_queue_active} jobs, deferring drain reindex.");
+            // Clear dedup key so schedule_drain_reindex can enqueue.
+            redis::cmd("DEL")
+                .arg("ordbokapi:drain-reindex-queued")
+                .query_async::<i64>(&mut self.redis_conn.clone())
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        redis::cmd("DEL")
+            .arg("ordbokapi:drain-reindex-queued")
+            .query_async::<i64>(&mut self.redis_conn.clone())
+            .await
+            .ok();
+
+        let members: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(Self::PENDING_REINDEX_KEY)
+            .query_async(&mut self.redis_conn.clone())
+            .await
+            .map_err(|e| anyhow!("Failed to SMEMBERS pending reindex: {e}"))?;
+
+        if members.is_empty() {
+            return Ok(());
+        }
+
+        redis::cmd("DEL")
+            .arg(Self::PENDING_REINDEX_KEY)
+            .query_async::<i64>(&mut self.redis_conn.clone())
+            .await
+            .ok();
+
+        let mut by_dict: HashMap<String, Vec<i64>> = HashMap::new();
+        for member in &members {
+            if let Some((dict, id_str)) = member.split_once(':')
+                && let Ok(id) = id_str.parse::<i64>()
+            {
+                by_dict.entry(dict.to_string()).or_default().push(id);
             }
         }
+
+        let total: usize = by_dict.values().map(|v| v.len()).sum();
+        info!(
+            "Batch reindexing {total} articles across {} dictionaries",
+            by_dict.len(),
+        );
+
+        let all_article_keys: Vec<(String, i64)> = by_dict
+            .iter()
+            .flat_map(|(dict, ids)| ids.iter().map(move |id| (dict.clone(), *id)))
+            .collect();
+
+        let mut article_place_map: HashMap<(String, i64), (Vec<i64>, Vec<i64>)> = HashMap::new();
+        let mut needed_place_ids: HashSet<i64> = HashSet::new();
+
+        for chunk in all_article_keys.chunks(5000) {
+            let dict_ids: Vec<&str> = chunk.iter().map(|(d, _)| d.as_str()).collect();
+            let art_ids: Vec<i64> = chunk.iter().map(|(_, id)| *id).collect();
+
+            let rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
+                "SELECT ap.dictionary, ap.article_id, ap.place_id, ap.context \
+                 FROM article_place ap \
+                 WHERE (ap.dictionary, ap.article_id) IN \
+                 (SELECT * FROM UNNEST($1::text[], $2::bigint[]))",
+            )
+            .bind(&dict_ids)
+            .bind(&art_ids)
+            .fetch_all(&self.db)
+            .await?;
+
+            for (dict, article_id, place_id, context) in rows {
+                needed_place_ids.insert(place_id);
+                let entry = article_place_map.entry((dict, article_id)).or_default();
+                match context.as_str() {
+                    "dialect" => entry.0.push(place_id),
+                    "attestation" => entry.1.push(place_id),
+                    _ => {}
+                }
+            }
+        }
+
+        let place_id_vec: Vec<i64> = needed_place_ids.into_iter().collect();
+        let place_rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, place_name, place_name_full, place_type FROM places \
+             WHERE id = ANY($1::bigint[])",
+        )
+        .bind(&place_id_vec)
+        .fetch_all(&self.db)
+        .await?;
+
+        let place_map: HashMap<i64, (String, String, String)> = place_rows
+            .into_iter()
+            .map(|(id, name, full_name, ptype)| (id, (name, full_name, ptype)))
+            .collect();
+
+        let bib_rows: Vec<(i64, String, String, String, String)> =
+            sqlx::query_as("SELECT id, code, author, title, year FROM bibliography")
+                .fetch_all(&self.db)
+                .await?;
+
+        let bib_map: HashMap<i64, (String, String, String, String)> = bib_rows
+            .into_iter()
+            .map(|(id, code, author, title, year)| (id, (code, author, title, year)))
+            .collect();
+
+        for (dict, ids) in &by_dict {
+            let idx = self.meili.index(meili::index_name(dict));
+
+            let mut batch: Vec<meili::ArticleSearchDocument> = Vec::with_capacity(5000);
+            let mut tasks = Vec::new();
+
+            for chunk in ids.chunks(5000) {
+                let rows: Vec<(i64, Value)> = sqlx::query_as(
+                    "SELECT id, data FROM articles WHERE dictionary = $1 AND id = ANY($2::bigint[])",
+                )
+                .bind(dict.as_str())
+                .bind(chunk)
+                .fetch_all(&self.db)
+                .await?;
+
+                for (id, data) in &rows {
+                    let bib = meili::build_article_bibliography(data, &bib_map);
+                    let (dialect_ids, attestation_ids) = article_place_map
+                        .get(&(dict.clone(), *id))
+                        .cloned()
+                        .unwrap_or_default();
+                    let places = meili::build_article_place_data_split(
+                        &dialect_ids,
+                        &attestation_ids,
+                        &place_map,
+                    );
+                    batch.push(meili::build_search_document(
+                        dict,
+                        *id,
+                        data,
+                        Some(&bib),
+                        Some(&places),
+                    ));
+
+                    if batch.len() >= 5000 {
+                        tasks.push(idx.add_or_replace(&batch, Some("id")).await?);
+                        batch.clear();
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                tasks.push(idx.add_or_replace(&batch, Some("id")).await?);
+            }
+
+            let timeout = Some(std::time::Duration::from_secs(300));
+            for task in tasks {
+                task.wait_for_completion(&self.meili, None, timeout).await?;
+            }
+        }
+
+        info!("Batch reindex complete.");
 
         Ok(())
     }
@@ -1394,7 +1941,17 @@ impl ArticleSyncService {
             self.enqueue_place_ids(&child_ids).await?;
         }
 
-        self.reindex_articles_for_place(place_id).await?;
+        let place_name = entry
+            .get("place_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !place_name.is_empty() {
+            self.resolve_inline_place_by_name(place_id, place_name)
+                .await?;
+        }
+
+        self.mark_articles_for_reindex(place_id).await?;
+        self.schedule_drain_reindex().await?;
 
         info!("Place entry {place_id} synced");
         Ok(())
@@ -1508,6 +2065,341 @@ impl ArticleSyncService {
         .bind(weight_threshold)
         .execute(&self.db)
         .await?;
+
+        Ok(())
+    }
+}
+
+/// A parsed inline bibliography reference found in example quote text.
+#[derive(Debug, Clone, PartialEq)]
+struct InlineRef {
+    /// The full quote.content string containing the inline ref.
+    quote_content: String,
+    /// Byte offset where the opening `(` is in quote_content.
+    offset_start: usize,
+    /// Byte offset after the closing `)` in quote_content.
+    offset_end: usize,
+    /// The parsed bibliography code.
+    code: String,
+    /// The spec/page portion, if any.
+    spec: Option<String>,
+}
+
+/// Matches inline bibliography references in text.
+static INLINE_REF_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:\S| )\(([^)]+)\)").unwrap());
+
+impl ArticleSyncService {
+    /// Extract inline bibliography references from all example quotes in an article.
+    fn extract_inline_refs(article: &Value) -> Vec<InlineRef> {
+        let mut refs = Vec::new();
+        let body = match article.get("body") {
+            Some(b) => b,
+            None => return refs,
+        };
+        Self::collect_inline_refs_recursive(body, &mut refs);
+        refs
+    }
+
+    /// Extract inline bibliography refs from content in raw article data.
+    fn collect_inline_refs_recursive(value: &Value, refs: &mut Vec<InlineRef>) {
+        match value {
+            Value::Object(map) => {
+                let type_ = map.get("type_").and_then(|v| v.as_str());
+                if type_ == Some("example") {
+                    if let Some(content) = map
+                        .get("quote")
+                        .and_then(|q| q.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        Self::extract_refs_from_quote(content, refs);
+                    }
+                } else if type_ == Some("explanation")
+                    && let Some(content) = map.get("content").and_then(|c| c.as_str())
+                {
+                    Self::extract_refs_from_quote(content, refs);
+                }
+                for v in map.values() {
+                    Self::collect_inline_refs_recursive(v, refs);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    Self::collect_inline_refs_recursive(v, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse inline bibliography references from a single quote content string.
+    fn extract_refs_from_quote(content: &str, refs: &mut Vec<InlineRef>) {
+        for cap in INLINE_REF_REGEX.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let inner = &cap[1];
+
+            let paren_start = full_match.start() + full_match.as_str().find('(').unwrap();
+            let paren_end = full_match.end();
+
+            // Handle multiple refs separated by semicolons, e.g.
+            // "(ordt, Meløy; StjørOrdt 21)".
+            for segment in inner.split(';') {
+                let segment = segment.trim();
+                if segment.is_empty() {
+                    continue;
+                }
+
+                let (code, spec) = match segment.find(' ') {
+                    Some(pos) => {
+                        let code = &segment[..pos];
+                        let spec = segment[pos + 1..].trim();
+                        (code, if spec.is_empty() { None } else { Some(spec) })
+                    }
+                    None => (segment, None),
+                };
+
+                let first_char = code.chars().next().unwrap_or(' ');
+                if !first_char.is_uppercase() {
+                    continue;
+                }
+
+                refs.push(InlineRef {
+                    quote_content: content.to_string(),
+                    offset_start: paren_start,
+                    offset_end: paren_end,
+                    code: code.to_string(),
+                    spec: spec.map(|s| s.to_string()),
+                });
+            }
+        }
+    }
+
+    /// Store extracted inline refs and resolve codes against the bibliography
+    /// and places tables.
+    async fn store_inline_refs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        dict_str: &str,
+        article_id: i64,
+        refs: &[InlineRef],
+    ) -> Result<(Vec<i64>, Vec<String>)> {
+        sqlx::query("DELETE FROM inline_ref_parse WHERE dictionary = $1 AND article_id = $2")
+            .bind(dict_str)
+            .bind(article_id)
+            .execute(&mut **tx)
+            .await?;
+
+        if refs.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let codes: Vec<&str> = refs
+            .iter()
+            .map(|r| r.code.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let resolved_bibl: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, code FROM bibliography WHERE code = ANY($1)")
+                .bind(&codes)
+                .fetch_all(&mut **tx)
+                .await?;
+
+        let mut code_to_bibl: HashMap<&str, i64> = HashMap::new();
+        for (id, code) in &resolved_bibl {
+            code_to_bibl.entry(code.as_str()).or_insert(*id);
+        }
+
+        let unresolved_codes: Vec<&str> = codes
+            .iter()
+            .filter(|c| !code_to_bibl.contains_key(*c))
+            .copied()
+            .collect();
+
+        let mut code_to_place: HashMap<&str, i64> = HashMap::new();
+        if !unresolved_codes.is_empty() {
+            let place_names: Vec<String> = unresolved_codes
+                .iter()
+                .flat_map(|c| {
+                    let mut names = vec![c.to_string()];
+                    if let Some(stripped) = c.strip_suffix('M') {
+                        names.push(stripped.to_string());
+                    }
+                    names
+                })
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let resolved_places: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, place_name FROM places WHERE place_name = ANY($1)")
+                    .bind(&place_names)
+                    .fetch_all(&mut **tx)
+                    .await?;
+
+            let place_name_to_id: HashMap<&str, i64> = resolved_places
+                .iter()
+                .map(|(id, name)| (name.as_str(), *id))
+                .collect();
+
+            for code in &unresolved_codes {
+                if let Some(&pid) = place_name_to_id.get(*code) {
+                    code_to_place.insert(code, pid);
+                } else if let Some(stripped) = code.strip_suffix('M')
+                    && let Some(&pid) = place_name_to_id.get(stripped)
+                {
+                    code_to_place.insert(code, pid);
+                }
+            }
+        }
+
+        let mut resolved_bibl_ids = Vec::new();
+
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO inline_ref_parse \
+             (dictionary, article_id, quote_content, offset_start, offset_end, code, spec, ref_type, bibl_id, place_id) ",
+        );
+        qb.push_values(refs, |mut b, r| {
+            let bibl_id = code_to_bibl.get(r.code.as_str()).copied();
+            let place_id = code_to_place.get(r.code.as_str()).copied();
+            let ref_type = if bibl_id.is_some() {
+                Some("bibl")
+            } else if place_id.is_some() {
+                Some("place")
+            } else {
+                None
+            };
+
+            if let Some(id) = bibl_id {
+                resolved_bibl_ids.push(id);
+            }
+
+            b.push_bind(dict_str.to_owned())
+                .push_bind(article_id)
+                .push_bind(r.quote_content.clone())
+                .push_bind(r.offset_start as i32)
+                .push_bind(r.offset_end as i32)
+                .push_bind(r.code.clone())
+                .push_bind(r.spec.clone())
+                .push_bind(ref_type)
+                .push_bind(bibl_id)
+                .push_bind(place_id);
+        });
+        qb.build().execute(&mut **tx).await?;
+
+        let still_unresolved: Vec<String> = refs
+            .iter()
+            .filter(|r| {
+                !code_to_bibl.contains_key(r.code.as_str())
+                    && !code_to_place.contains_key(r.code.as_str())
+            })
+            .map(|r| r.code.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        Ok((resolved_bibl_ids, still_unresolved))
+    }
+
+    /// After a bibliography entry is synced, resolve any pending inline refs
+    /// that match the new entry's code.
+    async fn resolve_inline_ref_as_bibl(&self, bibl_id: i64, code: &str) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE inline_ref_parse SET bibl_id = $1, ref_type = 'bibl' \
+             WHERE code = $2 AND ref_type IS NULL",
+        )
+        .bind(bibl_id)
+        .bind(code)
+        .execute(&self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
+
+        info!(
+            "Resolved {} inline refs for code '{code}' to bibliography ID {bibl_id}",
+            result.rows_affected()
+        );
+
+        sqlx::query(
+            "INSERT INTO article_bibliography (dictionary, article_id, bibl_id) \
+             SELECT DISTINCT dictionary, article_id, $1 \
+             FROM inline_ref_parse \
+             WHERE code = $2 AND bibl_id = $1 \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(bibl_id)
+        .bind(code)
+        .execute(&self.db)
+        .await?;
+
+        let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+            "SELECT a.dictionary, a.id, a.data FROM articles a \
+             INNER JOIN inline_ref_parse irp \
+             ON a.dictionary = irp.dictionary AND a.id = irp.article_id \
+             WHERE irp.code = $1 AND irp.bibl_id = $2",
+        )
+        .bind(code)
+        .bind(bibl_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        for (dict_str, article_id, data) in &rows {
+            let dict = Self::parse_dict(dict_str)?;
+            if let Err(e) = self.index_article(dict, *article_id, data).await {
+                warn!("Failed to re-index article {article_id} after inline bibl resolution: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve any pending inline refs that match the given place name.
+    pub async fn resolve_inline_place_by_name(
+        &self,
+        place_id: i64,
+        place_name: &str,
+    ) -> Result<()> {
+        // Match both exact name and name + M suffix.
+        let code_with_m = format!("{place_name}M");
+        let codes = vec![place_name.to_string(), code_with_m];
+
+        let result = sqlx::query(
+            "UPDATE inline_ref_parse SET place_id = $1, ref_type = 'place' \
+             WHERE code = ANY($2) AND ref_type IS NULL",
+        )
+        .bind(place_id)
+        .bind(&codes)
+        .execute(&self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
+
+        info!(
+            "Resolved {} inline refs for place '{place_name}' to place ID {place_id}",
+            result.rows_affected()
+        );
+
+        let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+            "SELECT a.dictionary, a.id, a.data FROM articles a \
+             INNER JOIN inline_ref_parse irp \
+             ON a.dictionary = irp.dictionary AND a.id = irp.article_id \
+             WHERE irp.place_id = $1",
+        )
+        .bind(place_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        for (dict_str, article_id, data) in &rows {
+            let dict = Self::parse_dict(dict_str)?;
+            if let Err(e) = self.index_article(dict, *article_id, data).await {
+                warn!("Failed to re-index article {article_id} after inline place resolution: {e}");
+            }
+        }
 
         Ok(())
     }
@@ -1689,5 +2581,117 @@ mod tests {
         let mut ids = Vec::new();
         ArticleSyncService::find_related_article_ids(&data, &mut ids);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_refs_simple() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "dei dreiv med fjordfiske(Fj.Skr III,42)",
+            &mut refs,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "Fj.Skr");
+        assert_eq!(refs[0].spec.as_deref(), Some("III,42"));
+        assert_eq!(refs[0].offset_start, 24);
+        assert_eq!(
+            refs[0].offset_end,
+            "dei dreiv med fjordfiske(Fj.Skr III,42)".len()
+        );
+    }
+
+    #[test]
+    fn test_extract_refs_no_spec() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "ho sette seg ned og kvilde(HaBrev)",
+            &mut refs,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "HaBrev");
+        assert_eq!(refs[0].spec, None);
+    }
+
+    #[test]
+    fn test_extract_refs_with_trailing_text() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "han tok ljaaen sin(Fj.Skr II,87)og gjekk ut",
+            &mut refs,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "Fj.Skr");
+        assert_eq!(refs[0].spec.as_deref(), Some("II,87"));
+    }
+
+    #[test]
+    fn test_extract_refs_semicolon_separated() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "dei slo graset tidleg(ordt, Vik; DalOrdt 15)",
+            &mut refs,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "DalOrdt");
+        assert_eq!(refs[0].spec.as_deref(), Some("15"));
+    }
+
+    #[test]
+    fn test_extract_refs_skips_editorial_parens_with_space() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "garden (den gamle) var stor, og dei (folket) trivdest godt der(Heim.S 1901)",
+            &mut refs,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "Heim.S");
+        assert_eq!(refs[0].spec.as_deref(), Some("1901"));
+    }
+
+    #[test]
+    fn test_extract_refs_no_refs() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "det var stilt i fjorden den kvelden",
+            &mut refs,
+        );
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_refs_skips_lowercase_code() {
+        let mut refs = Vec::new();
+        ArticleSyncService::extract_refs_from_quote(
+            "dei budde langt inne i dalen(ordt, Vik)",
+            &mut refs,
+        );
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_inline_refs_from_article() {
+        let article = json!({
+            "body": {
+                "definitions": [{
+                    "type_": "definition",
+                    "id": 1,
+                    "elements": [{
+                        "type_": "example",
+                        "quote": { "content": "dei rodde ut kvar morgon(Fj.Skr 104)", "items": [] },
+                        "attest": [],
+                        "explanation": { "content": "", "items": [] }
+                    }, {
+                        "type_": "example",
+                        "quote": { "content": "vanleg tekst utan kjelde", "items": [] },
+                        "attest": [],
+                        "explanation": { "content": "", "items": [] }
+                    }]
+                }]
+            }
+        });
+        let refs = ArticleSyncService::extract_inline_refs(&article);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].code, "Fj.Skr");
+        assert_eq!(refs[0].spec.as_deref(), Some("104"));
     }
 }

@@ -35,6 +35,7 @@ futures = "0.3.32"
 meilisearch-sdk = "0.33.0"
 num_cpus = "1.17.0"
 redis = { version = "1.2.1", features = ["aio", "connection-manager", "tokio-comp"] }
+regex = "1.12.3"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -44,6 +45,7 @@ tokio-macros = "2.7.0"
 tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
+urlencoding = "2.1.3"
 dotenvy = { version = "0.15.7", optional = true }
 matrix-sdk = { version = "0.17.0", optional = true, default-features = false, features = ["markdown"] }
 pulldown-cmark = { version = "0.13.3", optional = true }
