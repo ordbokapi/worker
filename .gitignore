@@ -17,8 +17,8 @@
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
 /target
-.meilidata
-.pgdata
-.valkey
-.valkey-backup
+.meilidata*
+.pgdata*
+.valkey*
 .env
+ordbokapi-dump.sql

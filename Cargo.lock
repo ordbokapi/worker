@@ -2560,6 +2560,7 @@ dependencies = [
  "num_cpus",
  "predicates",
  "pulldown-cmark",
+ "rand 0.10.1",
  "redis",
  "regex",
  "reqwest 0.13.3",

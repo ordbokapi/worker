@@ -16,9 +16,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
-// Library module to expose components for testing and integration
-
-pub mod article_sync_service;
+pub mod extraction;
+pub mod indexing;
+pub mod jobs;
 #[cfg(feature = "matrix_notifs")]
 pub mod matrix_notify_service;
 pub mod meili;
+pub mod outbox;
+pub mod state;
+pub mod storage;
+pub mod sync_service;
+pub mod uib_client;

@@ -16,10 +16,17 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
-mod article_sync_service;
+mod extraction;
+mod indexing;
+mod jobs;
 #[cfg(feature = "matrix_notifs")]
 mod matrix_notify_service;
 mod meili;
+mod outbox;
+mod state;
+mod storage;
+mod sync_service;
+mod uib_client;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -36,18 +43,22 @@ use axum::Router;
 use clap::value_parser;
 use cron::Schedule;
 use meilisearch_sdk::client::Client as MeiliClient;
+use rand::RngExt;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info, warn};
 
-use crate::article_sync_service::{
-    ArticleSyncService, BackfillInlineRefsJob, DrainPendingReindexJob, FetchArticleJob,
-    FetchArticleListJob, FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob,
-    ResolveInlineCodeJob, UibDictionary,
+use crate::jobs::{
+    BackfillInlineRefsJob, BatchIndexJob, FetchArticleJob, FetchArticleListJob,
+    FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, IndexArticleJob,
+    ResolveInlineCodeJob, SweepJob,
 };
+use crate::state::UibDictionary;
+use crate::sync_service::SyncService;
+use crate::uib_client::UibClient;
 
 #[cfg(feature = "matrix_notifs")]
-use crate::article_sync_service::SendMatrixMessageJob;
+use crate::jobs::SendMatrixMessageJob;
 
 #[derive(Default, Clone)]
 struct JobTracker {
@@ -82,31 +93,49 @@ impl Drop for JobGuard {
     }
 }
 
+/// Check if error is a transient error, e.g. a temporary network issue, that
+/// warrants a retry.
+#[allow(clippy::borrowed_box)] // Required due to Apalis's retry_if API signature.
+fn is_transient_job_error(err: &Box<dyn std::error::Error + Send + Sync + 'static>) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err.as_ref());
+    while let Some(e) = source {
+        if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+            if reqwest_err.is_timeout() || reqwest_err.is_connect() || reqwest_err.is_request() {
+                return true;
+            }
+            return reqwest_err.status().is_none_or(|s| {
+                s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS
+            });
+        }
+        source = e.source();
+    }
+    // Assume the error is transient if we can't get more details.
+    true
+}
+
 #[cfg(feature = "sentry_integration")]
 use sentry::integrations::anyhow::capture_anyhow;
 
 #[cfg(feature = "sentry_integration")]
 fn init_sentry() -> Option<sentry::ClientInitGuard> {
-    match std::env::var("SENTRY_ENDPOINT") {
-        Ok(dsn) => {
-            let guard = sentry::init((
+    std::env::var("SENTRY_ENDPOINT")
+        .ok()
+        .map(|dsn| {
+            sentry::init((
                 dsn,
                 sentry::ClientOptions {
                     environment: std::env::var("ENVIRONMENT").ok().map(Into::into),
                     release: sentry::release_name!(),
                     ..Default::default()
                 },
-            ));
-            Some(guard)
-        }
-        Err(_) => {
+            ))
+        })
+        .or_else(|| {
             warn!("SENTRY_ENDPOINT not set; skipping sentry initialization.");
             None
-        }
-    }
+        })
 }
 
-/// Create a RedisStorage with the given namespace.
 fn redis_storage<T>(conn: &ConnectionManager, namespace: &str) -> RedisStorage<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
@@ -117,17 +146,19 @@ where
     )
 }
 
-/// Register one or more workers with the monitor.
 macro_rules! register_workers {
-    ($monitor:expr, $svc:expr, $tracker:expr, $($name:literal => $backend:expr, $concurrency:expr, $handler:expr);+ $(;)?) => {{
+    ($monitor:expr, $svc:expr, $tracker:expr, $retry:expr, $instance_id:expr, $($name:literal => $backend:expr, $concurrency:expr, $handler:expr);+ $(;)?) => {{
         let monitor = $monitor;
         $(
             let s = $svc.clone();
             let t = $tracker.clone();
             let b = $backend;
+            let r = $retry.clone();
+            let worker_name = format!("{}-{}", $name, $instance_id);
             let monitor = monitor.register(move |_| {
-                WorkerBuilder::new($name)
+                WorkerBuilder::new(&worker_name)
                     .backend(b.clone())
+                    .retry(r.clone())
                     .concurrency($concurrency)
                     .data(s.clone())
                     .data(t.clone())
@@ -157,19 +188,47 @@ async fn main() -> Result<()> {
     #[cfg(feature = "sentry_integration")]
     let _sentry_guard = init_sentry();
 
-    // Used to notify Matrix when events occur.
     #[cfg(feature = "matrix_notifs")]
     let mut matrix_service_opt: Option<matrix_notify_service::MatrixNotifyService> = None;
 
-    // Inner run function which is wrapped to be able to report errors to Matrix.
-    async fn run(
-        #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<
-            matrix_notify_service::MatrixNotifyService,
-        >,
-    ) -> Result<()> {
-        let matches = clap::Command::new("Ordbok API Worker")
-            .version(env!("CARGO_PKG_VERSION"))
-            .author("Adaline Simonian <adalinesimonian@gmail.com>")
+    if let Err(err) = run(
+        #[cfg(feature = "matrix_notifs")]
+        &mut matrix_service_opt,
+    )
+    .await
+    {
+        error!("Application error: {err}");
+
+        #[cfg(feature = "sentry_integration")]
+        {
+            capture_anyhow(&err);
+        }
+
+        #[cfg(feature = "matrix_notifs")]
+        {
+            if let Some(matrix_service) = matrix_service_opt.as_mut() {
+                matrix_service
+                    .send_message(
+                        format!("@room 🚨 **Arbeidarprosessen kræsja**\n\n```{err}```").as_str(),
+                    )
+                    .await;
+            }
+        }
+
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run(
+    #[cfg(feature = "matrix_notifs")] matrix_service_opt: &mut Option<
+        matrix_notify_service::MatrixNotifyService,
+    >,
+) -> Result<()> {
+    let matches = clap::Command::new("Ordbok API Worker")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("Adaline Simonian <adalinesimonian@gmail.com>")
             .about("Ordbok API worker service")
             .max_term_width(100)
             .arg(
@@ -196,389 +255,418 @@ async fn main() -> Result<()> {
             )
             .get_matches();
 
-        let log_level = matches
-            .get_one::<String>("log-level")
-            .map(String::as_str)
-            .unwrap_or("info");
+    let log_level = matches
+        .get_one::<String>("log-level")
+        .map_or("info", String::as_str);
 
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-            )
-            .init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .init();
 
-        let resync_dictionaries = if let Some(subcmd) = matches.subcommand_matches("resync") {
-            let dicts = subcmd
-                .get_many::<UibDictionary>("dictionary")
-                .unwrap_or_default()
-                .cloned()
-                .collect::<Vec<_>>();
+    let resync_dictionaries =
+        matches
+            .subcommand_matches("resync")
+            .map_or_else(Vec::new, |subcmd| {
+                let dicts = subcmd
+                    .get_many::<UibDictionary>("dictionary")
+                    .unwrap_or_default()
+                    .copied()
+                    .collect::<Vec<_>>();
 
-            if dicts.is_empty() {
-                info!("Resyncing all dictionaries.");
-                UibDictionary::all().to_vec()
-            } else {
-                info!("Resyncing dictionaries: {dicts:?}");
-                dicts
-            }
-        } else {
-            vec![]
-        };
-
-        let num_workers = num_cpus::get();
-        info!("Launching Ordbok API sync worker with up to {num_workers} threads.");
-
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost:5432/ordbokapi".to_string());
-        info!("Connecting to PostgreSQL…");
-
-        let db = PgPoolOptions::new()
-            .max_connections(20)
-            .connect(&database_url)
-            .await?;
-
-        info!("Connected to PostgreSQL.");
-
-        let meili_url =
-            std::env::var("MEILI_URL").unwrap_or_else(|_| "http://127.0.0.1:7700".to_string());
-        let meili_key = std::env::var("MEILI_API_KEY").ok();
-        info!(
-            "Connecting to Meilisearch at {}…",
-            redact_url_credentials(&meili_url)
-        );
-
-        let meili = MeiliClient::new(&meili_url, meili_key.as_deref())?;
-
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        info!(
-            "Connecting to Redis at {}… for job queues…",
-            redact_url_credentials(&redis_url)
-        );
-
-        let redis_conn = apalis_redis::connect(redis_url).await?;
-
-        let fetch_article_list_storage =
-            redis_storage::<FetchArticleListJob>(&redis_conn, "apalis:article-list");
-        let fetch_article_storage = redis_storage::<FetchArticleJob>(&redis_conn, "apalis:article");
-        let fetch_dict_metadata_storage =
-            redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
-        let fetch_bibliography_storage =
-            redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
-        let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, "apalis:place");
-        let backfill_inline_refs_storage =
-            redis_storage::<BackfillInlineRefsJob>(&redis_conn, "apalis:backfill-inline-refs");
-        let resolve_inline_code_storage =
-            redis_storage::<ResolveInlineCodeJob>(&redis_conn, "apalis:resolve-inline-code");
-        let drain_pending_reindex_storage =
-            redis_storage::<DrainPendingReindexJob>(&redis_conn, "apalis:drain-pending-reindex");
-
-        #[cfg(feature = "matrix_notifs")]
-        let matrix_message_storage =
-            redis_storage::<SendMatrixMessageJob>(&redis_conn, "apalis:matrix-notify");
-
-        info!("Connected to Redis.");
-
-        #[cfg(feature = "matrix_notifs")]
-        {
-            let ms = matrix_notify_service::MatrixNotifyService::new().await;
-            *matrix_service_opt = Some(ms);
-        }
-
-        let health_db = db.clone();
-        let health_redis = redis_conn.clone();
-        let health_meili = meili.clone();
-
-        let api = ApiBuilder::new(Router::new())
-            .register(fetch_article_list_storage.clone())
-            .register(fetch_article_storage.clone())
-            .register(fetch_dict_metadata_storage.clone())
-            .register(fetch_bibliography_storage.clone())
-            .register(fetch_place_storage.clone());
-
-        #[cfg(feature = "matrix_notifs")]
-        let api = api.register(matrix_message_storage.clone());
-
-        let router = Router::new()
-            .route(
-                "/health",
-                axum::routing::get(move || {
-                    let db = health_db.clone();
-                    let mut redis = health_redis.clone();
-                    let meili = health_meili.clone();
-                    async move {
-                        let db_ok = sqlx::query("SELECT 1").execute(&db).await.is_ok();
-                        let redis_ok = redis::cmd("PING")
-                            .query_async::<String>(&mut redis)
-                            .await
-                            .is_ok();
-                        let meili_ok = meili.health().await.is_ok();
-
-                        if db_ok && redis_ok && meili_ok {
-                            (
-                                axum::http::StatusCode::OK,
-                                axum::Json(serde_json::json!({"status": "ok"})),
-                            )
-                        } else {
-                            (
-                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                axum::Json(serde_json::json!({
-                                    "status": "unhealthy",
-                                    "db": db_ok,
-                                    "redis": redis_ok,
-                                    "meili": meili_ok,
-                                })),
-                            )
-                        }
-                    }
-                }),
-            )
-            .nest("/api/v1", api.build())
-            .fallback_service(ServeUI::new());
-
-        let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-        tokio::spawn(async move {
-            let addr = format!("0.0.0.0:{http_port}");
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            info!("HTTP server listening on port {http_port}");
-            axum::serve(listener, router).await.unwrap();
-        });
-
-        info!("Running database migrations…");
-        sqlx::migrate!("./migrations").run(&db).await?;
-        info!("Migrations complete.");
-
-        meili::setup_indexes(&meili).await?;
-        info!("Meilisearch indexes configured.");
-
-        meili::reindex_if_needed(&meili, &db).await?;
-
-        let sync_service = ArticleSyncService {
-            db: db.clone(),
-            meili: meili.clone(),
-            redis_conn: redis_conn.clone(),
-            clarino_api_key: std::env::var("CLARINO_API_KEY").ok(),
-            fetch_article_list_storage: fetch_article_list_storage.clone(),
-            fetch_article_storage: fetch_article_storage.clone(),
-            fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
-            fetch_bibliography_storage: fetch_bibliography_storage.clone(),
-            fetch_place_storage: fetch_place_storage.clone(),
-            backfill_inline_refs_storage: backfill_inline_refs_storage.clone(),
-            resolve_inline_code_storage: resolve_inline_code_storage.clone(),
-            inline_refs_backfill_count: Arc::new(AtomicU64::new(0)),
-            drain_pending_reindex_storage: drain_pending_reindex_storage.clone(),
-            #[cfg(feature = "matrix_notifs")]
-            matrix_message_storage: matrix_message_storage.clone(),
-        };
-
-        if resync_dictionaries.is_empty() {
-            info!("Checking if initial sync is required…");
-            sync_service.initial_sync().await?;
-        } else {
-            // Flush all pending jobs before enqueueing fresh resync tasks.
-            info!("Flushing existing job queues before resync…");
-            redis::cmd("FLUSHDB")
-                .query_async::<()>(&mut redis_conn.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to flush Redis: {e}"))?;
-            info!("Job queues flushed.");
-
-            for d in resync_dictionaries {
-                info!("Enqueuing resync tasks for dictionary {:?}…", d);
-                if let Err(e) = sync_service.enqueue_sync_articles(d).await {
-                    error!("enqueue_sync_articles error: {e}");
+                if dicts.is_empty() {
+                    info!("Resyncing all dictionaries.");
+                    UibDictionary::all().to_vec()
+                } else {
+                    info!("Resyncing dictionaries: {dicts:?}");
+                    dicts
                 }
-                if let Err(e) = sync_service.enqueue_sync_dict_metadata(d).await {
-                    error!("enqueue_sync_dict_metadata error: {e}");
-                }
-            }
-        }
+            });
 
-        if let Err(e) = sync_service.enqueue_initial_bibliography_sync().await {
-            error!("Initial bibliography sync enqueue failed: {e}");
-        }
+    let num_workers = num_cpus::get();
+    info!("Launching Ordbok API sync worker with up to {num_workers} threads.");
 
-        if let Err(e) = sync_service.enqueue_inline_refs_backfill().await {
-            error!("Inline reference backfill enqueue failed: {e}");
-        }
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://localhost:5432/ordbokapi".to_string());
+    info!("Connecting to PostgreSQL…");
 
-        if let Err(e) = sync_service.enqueue_initial_place_sync().await {
-            error!("Initial place sync enqueue failed: {e}");
-        }
+    let db = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&database_url)
+        .await?;
 
-        let svc = sync_service.clone();
-        let job_tracker = JobTracker::default();
-        let article_concurrency = num_workers.clamp(4, 16);
+    info!("Connected to PostgreSQL.");
 
-        info!("Worker is now running. Press Ctrl+C to exit.");
+    let meili_url =
+        std::env::var("MEILI_URL").unwrap_or_else(|_| "http://127.0.0.1:7700".to_string());
+    let meili_key = std::env::var("MEILI_API_KEY").ok();
+    info!(
+        "Connecting to Meilisearch at {}…",
+        redact_url_credentials(&meili_url)
+    );
 
-        let monitor = register_workers!(Monitor::new(), svc, job_tracker,
-            "fetch-article-list" => fetch_article_list_storage, 1, handle_fetch_article_list;
-            "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
-            "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
-            "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
-            "fetch-place" => fetch_place_storage, 4, handle_fetch_place;
-            "backfill-inline-refs" => backfill_inline_refs_storage, 4, handle_backfill_inline_refs;
-            "resolve-inline-code" => resolve_inline_code_storage, 2, handle_resolve_inline_code;
-            "drain-pending-reindex" => drain_pending_reindex_storage, 1, handle_drain_pending_reindex;
-        );
+    let meili = MeiliClient::new(&meili_url, meili_key.as_deref())?;
 
-        // Set up cron for daily sync at 2 AM.
-        let schedule: Schedule = "0 0 2 * * *".parse()?;
-        let s = svc.clone();
-        let t = job_tracker.clone();
-        let monitor = monitor.register(move |_| {
-            WorkerBuilder::new("daily-sync")
-                .backend(CronStream::new(schedule.clone()))
-                .data(s.clone())
-                .data(t.clone())
-                .build(handle_daily_sync)
-        });
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    info!(
+        "Connecting to Redis at {}…",
+        redact_url_credentials(&redis_url)
+    );
 
-        #[cfg(feature = "matrix_notifs")]
-        let monitor = {
-            let ms = matrix_service_opt
-                .clone()
-                .unwrap_or_else(matrix_notify_service::MatrixNotifyService::empty);
-            let t = job_tracker.clone();
-            let b = matrix_message_storage;
-            monitor.register(move |_| {
-                WorkerBuilder::new("matrix-notify")
-                    .backend(b.clone())
-                    .concurrency(1)
-                    .data(ms.clone())
-                    .data(t.clone())
-                    .build(handle_matrix_message)
-            })
-        };
+    let redis_conn = apalis_redis::connect(redis_url).await?;
 
-        monitor
-            .on_event(|_ctx, e| {
-                let event_str = format!("{e:?}");
-                if event_str.contains("Error") || event_str.contains("Failed") {
-                    tracing::warn!("Worker event: {event_str}");
-                }
-            })
-            .run_with_signal(graceful_shutdown(job_tracker))
-            .await?;
+    let fetch_article_list_storage =
+        redis_storage::<FetchArticleListJob>(&redis_conn, "apalis:article-list");
+    let fetch_article_storage = redis_storage::<FetchArticleJob>(&redis_conn, "apalis:article");
+    let index_article_storage =
+        redis_storage::<IndexArticleJob>(&redis_conn, "apalis:index-article");
+    let batch_index_storage = redis_storage::<BatchIndexJob>(&redis_conn, "apalis:batch-index");
+    let fetch_dict_metadata_storage =
+        redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
+    let fetch_bibliography_storage =
+        redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
+    let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, "apalis:place");
+    let backfill_inline_refs_storage =
+        redis_storage::<BackfillInlineRefsJob>(&redis_conn, "apalis:backfill-inline-refs");
+    let resolve_inline_code_storage =
+        redis_storage::<ResolveInlineCodeJob>(&redis_conn, "apalis:resolve-inline-code");
+    let _sweep_storage = redis_storage::<SweepJob>(&redis_conn, "apalis:sweep");
 
-        Ok(())
-    }
+    #[cfg(feature = "matrix_notifs")]
+    let matrix_message_storage =
+        redis_storage::<SendMatrixMessageJob>(&redis_conn, "apalis:matrix-notify");
 
-    // Run the main logic and handle errors
-    if let Err(err) = run(
-        #[cfg(feature = "matrix_notifs")]
-        &mut matrix_service_opt,
-    )
-    .await
+    info!("Connected to Redis.");
+
+    #[cfg(feature = "matrix_notifs")]
     {
-        error!("Application error: {err}");
-
-        #[cfg(feature = "sentry_integration")]
-        {
-            capture_anyhow(&err);
-        }
-
-        // If MatrixNotifyService is available, send an alert
-        #[cfg(feature = "matrix_notifs")]
-        {
-            if let Some(matrix_service) = matrix_service_opt.as_mut() {
-                matrix_service
-                    .send_message(
-                        format!("@room 🚨 **Arbeidarprosessen kræsja**\n\n```{err}```").as_str(),
-                    )
-                    .await;
-            }
-        }
-
-        return Err(err);
+        let ms = matrix_notify_service::MatrixNotifyService::new().await;
+        *matrix_service_opt = Some(ms);
     }
+
+    let health_db = db.clone();
+    let health_redis = redis_conn.clone();
+    let health_meili = meili.clone();
+
+    let api = ApiBuilder::new(Router::new())
+        .register(fetch_article_list_storage.clone())
+        .register(fetch_article_storage.clone())
+        .register(index_article_storage.clone())
+        .register(batch_index_storage.clone())
+        .register(fetch_dict_metadata_storage.clone())
+        .register(fetch_bibliography_storage.clone())
+        .register(fetch_place_storage.clone());
+
+    #[cfg(feature = "matrix_notifs")]
+    let api = api.register(matrix_message_storage.clone());
+
+    let router = Router::new()
+        .route(
+            "/health",
+            axum::routing::get(move || {
+                let db = health_db.clone();
+                let mut redis = health_redis.clone();
+                let meili = health_meili.clone();
+                async move {
+                    let db_ok = sqlx::query("SELECT 1").execute(&db).await.is_ok();
+                    let redis_ok = redis::cmd("PING")
+                        .query_async::<String>(&mut redis)
+                        .await
+                        .is_ok();
+                    let meili_ok = meili.health().await.is_ok();
+
+                    if db_ok && redis_ok && meili_ok {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({"status": "ok"})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({
+                                "status": "unhealthy",
+                                "db": db_ok,
+                                "redis": redis_ok,
+                                "meili": meili_ok,
+                            })),
+                        )
+                    }
+                }
+            }),
+        )
+        .nest("/api/v1", api.build())
+        .fallback_service(ServeUI::new());
+
+    let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{http_port}");
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        info!("HTTP server listening on port {http_port}");
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    info!("Running database migrations…");
+    sqlx::migrate!("./migrations").run(&db).await?;
+    info!("Migrations complete.");
+
+    meili::setup_indexes(&meili).await?;
+    info!("Meilisearch indexes configured.");
+
+    meili::reindex_if_needed(&meili, &db).await?;
+
+    let http_client = UibClient::new(std::env::var("CLARINO_API_KEY").ok());
+
+    let sync_service = SyncService {
+        db: db.clone(),
+        meili: meili.clone(),
+        http: http_client,
+        inline_refs_backfill_count: Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "matrix_notifs")]
+        matrix_message_storage: matrix_message_storage.clone(),
+    };
+
+    let outbox_db = db.clone();
+    let outbox_storages = outbox::OutboxStorages {
+        fetch_article: fetch_article_storage.clone(),
+        index_article: index_article_storage.clone(),
+        batch_index: batch_index_storage.clone(),
+        fetch_bibliography: fetch_bibliography_storage.clone(),
+        fetch_place: fetch_place_storage.clone(),
+        resolve_inline_code: resolve_inline_code_storage.clone(),
+    };
+    tokio::spawn(async move {
+        outbox::run_outbox_poller(outbox_db, outbox_storages).await;
+    });
+
+    if resync_dictionaries.is_empty() {
+        info!("Checking if initial sync is required…");
+        sync_service
+            .initial_sync(&fetch_article_list_storage, &fetch_dict_metadata_storage)
+            .await?;
+    } else {
+        sync_service
+            .enqueue_resync(
+                &resync_dictionaries,
+                &fetch_article_list_storage,
+                &fetch_dict_metadata_storage,
+            )
+            .await?;
+    }
+
+    if let Err(e) = sync_service.enqueue_initial_bibliography_sync().await {
+        error!("Initial bibliography sync enqueue failed: {e}");
+    }
+
+    if let Err(e) = sync_service
+        .enqueue_inline_refs_backfill(&backfill_inline_refs_storage)
+        .await
+    {
+        error!("Inline reference backfill enqueue failed: {e}");
+    }
+
+    if let Err(e) = sync_service.enqueue_initial_place_sync().await {
+        error!("Initial place sync enqueue failed: {e}");
+    }
+
+    let svc = sync_service.clone();
+    let job_tracker = JobTracker::default();
+    let article_concurrency = num_workers.clamp(4, 16);
+
+    let daily_fal = fetch_article_list_storage.clone();
+    let daily_fdm = fetch_dict_metadata_storage.clone();
+
+    let instance_id: String = {
+        let bytes: [u8; 4] = rand::rng().random();
+        format!("{:08x}", u32::from_ne_bytes(bytes))
+    };
+
+    info!("Worker instance {instance_id} is now running. Press Ctrl+C to exit.");
+
+    let retry_policy =
+        apalis::layers::retry::RetryPolicy::retries(3).retry_if(is_transient_job_error);
+
+    let monitor = register_workers!(Monitor::new(), svc, job_tracker, retry_policy, &instance_id,
+        "fetch-article-list" => fetch_article_list_storage, 1, handle_fetch_article_list;
+        "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
+        "index-article" => index_article_storage, article_concurrency, handle_index_article;
+        "batch-index" => batch_index_storage, 2, handle_batch_index;
+        "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
+        "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
+        "fetch-place" => fetch_place_storage, 4, handle_fetch_place;
+        "backfill-inline-refs" => backfill_inline_refs_storage, 4, handle_backfill_inline_refs;
+        "resolve-inline-code" => resolve_inline_code_storage, 2, handle_resolve_inline_code;
+    );
+
+    // Sweep every 5 minutes.
+    let sweep_schedule: Schedule = "0 */5 * * * *".parse()?;
+    let s = svc.clone();
+    let t = job_tracker.clone();
+    let sweep_name = format!("sweep-{instance_id}");
+    let monitor = monitor.register(move |_| {
+        WorkerBuilder::new(&sweep_name)
+            .backend(CronStream::new(sweep_schedule.clone()))
+            .data(s.clone())
+            .data(t.clone())
+            .build(handle_sweep)
+    });
+
+    // Daily sync at 2 AM.
+    let daily_schedule: Schedule = "0 0 2 * * *".parse()?;
+    let s = svc.clone();
+    let t = job_tracker.clone();
+    let daily_name = format!("daily-sync-{instance_id}");
+    let monitor = monitor.register(move |_| {
+        WorkerBuilder::new(&daily_name)
+            .backend(CronStream::new(daily_schedule.clone()))
+            .data(s.clone())
+            .data(t.clone())
+            .data(daily_fal.clone())
+            .data(daily_fdm.clone())
+            .build(handle_daily_sync)
+    });
+
+    #[cfg(feature = "matrix_notifs")]
+    let monitor = {
+        let ms = matrix_service_opt
+            .clone()
+            .unwrap_or_else(matrix_notify_service::MatrixNotifyService::empty);
+        let t = job_tracker.clone();
+        let b = matrix_message_storage;
+        let matrix_name = format!("matrix-notify-{instance_id}");
+        monitor.register(move |_| {
+            WorkerBuilder::new(&matrix_name)
+                .backend(b.clone())
+                .concurrency(1)
+                .data(ms.clone())
+                .data(t.clone())
+                .build(handle_matrix_message)
+        })
+    };
+
+    monitor
+        .on_event(|_ctx, e| {
+            let event_str = format!("{e:?}");
+            if event_str.contains("Error") || event_str.contains("Failed") {
+                tracing::warn!("Worker event: {event_str}");
+            }
+        })
+        .run_with_signal(graceful_shutdown(job_tracker))
+        .await?;
+
     Ok(())
 }
 
 async fn handle_fetch_article_list(
     job: FetchArticleListJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Syncing article list for {}", job.dictionary));
-    svc.handle_sync_articles(job).await
+    svc.handle_fetch_article_list(job).await
 }
 
 async fn handle_fetch_article(
     job: FetchArticleJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!(
-        "Fetching article {} «{}» ({})",
-        job.article_id, job.primary_lemma, job.dictionary
+        "Fetching article {}:{}",
+        job.dictionary, job.article_id
     ));
-    svc.handle_sync_article(job).await
+    svc.handle_fetch_article(job).await
+}
+
+async fn handle_index_article(
+    job: IndexArticleJob,
+    svc: Data<SyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!(
+        "Indexing article {}:{}",
+        job.dictionary, job.article_id
+    ));
+    svc.handle_index_article(job).await
+}
+
+async fn handle_batch_index(
+    job: BatchIndexJob,
+    svc: Data<SyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track(format!(
+        "Batch indexing {} articles",
+        job.article_keys.len()
+    ));
+    svc.handle_batch_index(job).await
 }
 
 async fn handle_fetch_dict_metadata(
     job: FetchDictionaryMetadataJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching metadata for {}", job.dictionary));
-    svc.handle_sync_dictionary_metadata(job).await
+    svc.handle_fetch_dict_metadata(job).await
 }
 
 async fn handle_fetch_bibliography(
     job: FetchBibliographyJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching bibliography {}", job.bibl_id));
-    svc.handle_sync_bibliography(job.bibl_id).await
+    svc.handle_fetch_bibliography(job).await
 }
 
 async fn handle_fetch_place(
     job: FetchPlaceJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Fetching place {}", job.place_id));
-    svc.handle_sync_place(job.place_id).await
+    svc.handle_fetch_place(job).await
 }
 
 async fn handle_backfill_inline_refs(
     job: BackfillInlineRefsJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!(
         "Backfill inline refs for {} articles",
         job.article_ids.len()
     ));
-    svc.handle_backfill_inline_refs(&job.article_ids).await
+    svc.handle_backfill_inline_refs(job).await
 }
 
 async fn handle_resolve_inline_code(
     job: ResolveInlineCodeJob,
-    svc: Data<ArticleSyncService>,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track(format!("Resolve inline code '{}'", job.code));
-    svc.handle_resolve_inline_code(&job.code).await
+    svc.handle_resolve_inline_code(job).await
 }
 
-async fn handle_drain_pending_reindex(
-    _job: DrainPendingReindexJob,
-    svc: Data<ArticleSyncService>,
+async fn handle_sweep(
+    _event: apalis_cron::Tick,
+    svc: Data<SyncService>,
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
-    let _guard = tracker.track("Drain pending reindex".to_string());
-    svc.handle_drain_pending_reindex().await
+    let _guard = tracker.track("Sweep stuck items".to_string());
+    svc.handle_sweep().await
 }
 
 async fn handle_daily_sync(
     _event: apalis_cron::Tick,
-    svc: Data<ArticleSyncService>,
+    #[cfg_attr(not(feature = "matrix_notifs"), allow(unused_variables))] svc: Data<SyncService>,
     tracker: Data<JobTracker>,
+    fetch_article_list_storage: Data<RedisStorage<FetchArticleListJob>>,
+    fetch_dict_metadata_storage: Data<RedisStorage<FetchDictionaryMetadataJob>>,
 ) -> Result<(), Error> {
     let _guard = tracker.track("Daily sync".to_string());
     info!("2 AM daily sync tasks fired.");
@@ -588,11 +676,24 @@ async fn handle_daily_sync(
         .await;
 
     for d in UibDictionary::all() {
-        if let Err(e) = svc.enqueue_sync_articles(*d).await {
-            error!("enqueue_sync_articles error: {e}");
+        let mut fal = (*fetch_article_list_storage).clone();
+        if let Err(e) = fal
+            .push(FetchArticleListJob {
+                dictionary: d.as_str().to_string(),
+            })
+            .await
+        {
+            error!("enqueue article list error: {e}");
         }
-        if let Err(e) = svc.enqueue_sync_dict_metadata(*d).await {
-            error!("enqueue_sync_dict_metadata error: {e}");
+
+        let mut fdm = (*fetch_dict_metadata_storage).clone();
+        if let Err(e) = fdm
+            .push(FetchDictionaryMetadataJob {
+                dictionary: d.as_str().to_string(),
+            })
+            .await
+        {
+            error!("enqueue dict metadata error: {e}");
         }
     }
     Ok(())
@@ -609,7 +710,6 @@ async fn handle_matrix_message(
     Ok(())
 }
 
-/// Shut down gracefully on Ctrl+C.
 async fn graceful_shutdown(tracker: JobTracker) -> std::io::Result<()> {
     tokio::signal::ctrl_c().await?;
 

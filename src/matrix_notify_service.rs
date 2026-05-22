@@ -32,12 +32,15 @@ pub struct MatrixNotifyService {
 
 fn get_empty_service() -> MatrixNotifyService {
     MatrixNotifyService {
-        last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600))),
+        last_send: Arc::new(Mutex::new(
+            Instant::now().checked_sub(Duration::from_hours(1)).unwrap(),
+        )),
         room: None,
     }
 }
 
 impl MatrixNotifyService {
+    #[must_use]
     pub fn empty() -> Self {
         get_empty_service()
     }
@@ -100,7 +103,9 @@ impl MatrixNotifyService {
         info!("Connected to Matrix.");
 
         Self {
-            last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600))),
+            last_send: Arc::new(Mutex::new(
+                Instant::now().checked_sub(Duration::from_hours(1)).unwrap(),
+            )),
             room: Some(room),
         }
     }

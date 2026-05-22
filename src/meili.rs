@@ -158,9 +158,9 @@ pub struct ArticlePlaceData {
 }
 
 /// Collect unique names, codes, and types from a slice of place IDs.
-fn collect_place_fields(
+fn collect_place_fields<S: std::hash::BuildHasher>(
     ids: &[i64],
-    place_map: &std::collections::HashMap<i64, (String, String, String)>,
+    place_map: &std::collections::HashMap<i64, (String, String, String), S>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut codes = Vec::new();
@@ -189,10 +189,11 @@ fn collect_place_fields(
 }
 
 /// Build split place metadata.
-pub fn build_article_place_data_split(
+#[must_use]
+pub fn build_article_place_data_split<S: std::hash::BuildHasher>(
     dialect_ids: &[i64],
     attestation_ids: &[i64],
-    place_map: &std::collections::HashMap<i64, (String, String, String)>,
+    place_map: &std::collections::HashMap<i64, (String, String, String), S>,
 ) -> ArticlePlaceData {
     let (dialect_names, dialect_codes, dialect_types) =
         collect_place_fields(dialect_ids, place_map);
@@ -223,6 +224,7 @@ pub fn build_article_place_data_split(
 }
 
 /// Build a `BibliographySearchDocument` from a Clarino API response entry.
+#[must_use]
 pub fn build_bibliography_document(
     bibl_id: i64,
     entry: &serde_json::Value,
@@ -254,9 +256,10 @@ pub fn build_bibliography_document(
 
 /// Extract bibliography IDs from article JSON and build bibliography metadata
 /// from a lookup map.
-pub fn build_article_bibliography(
+#[must_use]
+pub fn build_article_bibliography<S: std::hash::BuildHasher>(
     data: &serde_json::Value,
-    bib_map: &std::collections::HashMap<i64, (String, String, String, String)>,
+    bib_map: &std::collections::HashMap<i64, (String, String, String, String), S>,
 ) -> ArticleBibliography {
     let mut all_bibl_ids: Vec<i64> = Vec::new();
     let mut older_source_ids: Vec<i64> = Vec::new();
@@ -264,46 +267,48 @@ pub fn build_article_bibliography(
     let mut attestation_source_ids: Vec<i64> = Vec::new();
 
     // Older sources
-    if let Some(sources) = data
+    for id in data
         .get("body")
         .and_then(|b| b.get("older_source"))
         .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|source| source.get("bibl_id").and_then(serde_json::Value::as_i64))
     {
-        for source in sources {
-            if let Some(id) = source.get("bibl_id").and_then(|v| v.as_i64()) {
-                if !older_source_ids.contains(&id) {
-                    older_source_ids.push(id);
-                }
-                if !all_bibl_ids.contains(&id) {
-                    all_bibl_ids.push(id);
-                }
-            }
+        if !older_source_ids.contains(&id) {
+            older_source_ids.push(id);
+        }
+        if !all_bibl_ids.contains(&id) {
+            all_bibl_ids.push(id);
         }
     }
 
     // Written form sources.
-    if let Some(wf_arr) = data
+    for id in data
         .get("body")
         .and_then(|b| b.get("written_form"))
         .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|wf| {
+            wf.get("forms")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .flat_map(|form| {
+            form.get("sources")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|source| source.get("bibl_id").and_then(serde_json::Value::as_i64))
     {
-        for wf in wf_arr {
-            if let Some(forms) = wf.get("forms").and_then(|v| v.as_array()) {
-                for form in forms {
-                    if let Some(sources) = form.get("sources").and_then(|v| v.as_array()) {
-                        for source in sources {
-                            if let Some(id) = source.get("bibl_id").and_then(|v| v.as_i64()) {
-                                if !written_form_source_ids.contains(&id) {
-                                    written_form_source_ids.push(id);
-                                }
-                                if !all_bibl_ids.contains(&id) {
-                                    all_bibl_ids.push(id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if !written_form_source_ids.contains(&id) {
+            written_form_source_ids.push(id);
+        }
+        if !all_bibl_ids.contains(&id) {
+            all_bibl_ids.push(id);
         }
     }
 
@@ -326,9 +331,9 @@ pub fn build_article_bibliography(
     }
 }
 
-fn build_category(
+fn build_category<S: std::hash::BuildHasher>(
     ids: &[i64],
-    bib_map: &std::collections::HashMap<i64, (String, String, String, String)>,
+    bib_map: &std::collections::HashMap<i64, (String, String, String, String), S>,
 ) -> BibliographyCategory {
     let mut codes = Vec::new();
     let mut authors = Vec::new();
@@ -380,22 +385,25 @@ fn collect_attestation_from_defs(
     all_ids: &mut Vec<i64>,
 ) {
     for def in defs {
-        if let Some(elements) = def.get("elements").and_then(|v| v.as_array()) {
-            for element in elements {
-                if let Some(place_refs) = element.get("place_refs").and_then(|v| v.as_array()) {
-                    for pr in place_refs {
-                        let vis = pr.get("vis").and_then(|v| v.as_i64()).unwrap_or(0);
-                        if vis == 1
-                            && let Some(id) = pr.get("bibl_id").and_then(|v| v.as_i64())
-                        {
-                            if !attestation_ids.contains(&id) {
-                                attestation_ids.push(id);
-                            }
-                            if !all_ids.contains(&id) {
-                                all_ids.push(id);
-                            }
-                        }
-                    }
+        let elements = def.get("elements").and_then(|v| v.as_array());
+        for pr in elements.into_iter().flatten().flat_map(|el| {
+            el.get("place_refs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+        }) {
+            let vis = pr
+                .get("vis")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if vis == 1
+                && let Some(id) = pr.get("bibl_id").and_then(serde_json::Value::as_i64)
+            {
+                if !attestation_ids.contains(&id) {
+                    attestation_ids.push(id);
+                }
+                if !all_ids.contains(&id) {
+                    all_ids.push(id);
                 }
             }
         }
@@ -408,7 +416,7 @@ fn collect_attestation_from_defs(
 fn collect_bibl_ids(value: &serde_json::Value, ids: &mut Vec<i64>) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(bibl_id) = map.get("bibl_id").and_then(|v| v.as_i64())
+            if let Some(bibl_id) = map.get("bibl_id").and_then(serde_json::Value::as_i64)
                 && !ids.contains(&bibl_id)
             {
                 ids.push(bibl_id);
@@ -427,6 +435,7 @@ fn collect_bibl_ids(value: &serde_json::Value, ids: &mut Vec<i64>) {
 }
 
 /// Index name for a given dictionary.
+#[must_use]
 pub fn index_name(dict: &str) -> String {
     format!("articles-{dict}")
 }
@@ -443,6 +452,18 @@ pub struct ArticleBibliography {
     pub all: BibliographyCategory,
 }
 
+impl ArticleBibliography {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            older_source: BibliographyCategory::empty(),
+            written_form_source: BibliographyCategory::empty(),
+            attestation_source: BibliographyCategory::empty(),
+            all: BibliographyCategory::empty(),
+        }
+    }
+}
+
 /// Bibliography metadata for a single category.
 pub struct BibliographyCategory {
     pub codes: Vec<String>,
@@ -451,247 +472,306 @@ pub struct BibliographyCategory {
     pub years: Vec<String>,
 }
 
-/// Build an `ArticleSearchDocument` from an article's JSON data.
-pub fn build_search_document(
-    dictionary: &str,
-    article_id: i64,
-    data: &serde_json::Value,
-    bibliography: Option<&ArticleBibliography>,
-    place_data: Option<&ArticlePlaceData>,
-) -> ArticleSearchDocument {
+impl BibliographyCategory {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            codes: vec![],
+            authors: vec![],
+            titles: vec![],
+            years: vec![],
+        }
+    }
+}
+
+/// Recursively extract definition content, examples, and lemmas for sub
+/// articles.
+fn extract_definition_content(
+    defs: &[serde_json::Value],
+    def_parts: &mut Vec<String>,
+    ex_parts: &mut Vec<String>,
+    sub_lemmas: &mut Vec<String>,
+) {
+    for def in defs {
+        for element in def
+            .get("elements")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let type_ = element.get("type_").and_then(|v| v.as_str()).unwrap_or("");
+            match type_ {
+                "explanation" => {
+                    if let Some(content) = element.get("content").and_then(|v| v.as_str())
+                        && !content.is_empty()
+                    {
+                        def_parts.push(content.to_string());
+                    }
+                }
+                "example" => {
+                    if let Some(content) = element
+                        .get("quote")
+                        .and_then(|q| q.get("content"))
+                        .and_then(|v| v.as_str())
+                        && !content.is_empty()
+                    {
+                        ex_parts.push(content.to_string());
+                    }
+                }
+                "sub_article" => {
+                    for s in element
+                        .get("lemmas")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|l| l.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !sub_lemmas.contains(&s.to_string()) {
+                            sub_lemmas.push(s.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(sub_defs) = def.get("sub_definitions").and_then(|v| v.as_array()) {
+            extract_definition_content(sub_defs, def_parts, ex_parts, sub_lemmas);
+        }
+    }
+}
+
+struct LemmaData {
+    lemmas: Vec<String>,
+    suggest: Vec<String>,
+    inflections: Vec<String>,
+    paradigm_tags: Vec<String>,
+    inflection_tags: Vec<String>,
+    has_split_inf: bool,
+}
+
+fn extract_lemma_data(data: &serde_json::Value) -> LemmaData {
     let mut lemmas = Vec::new();
-    let mut suggest = Vec::new();
     let mut inflections = Vec::new();
     let mut paradigm_tags = Vec::new();
     let mut inflection_tags = Vec::new();
+    let mut has_split_inf = false;
+
+    for lemma_obj in data
+        .get("lemmas")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(lemma_str) = lemma_obj.get("lemma").and_then(|v| v.as_str()) {
+            lemmas.push(lemma_str.to_string());
+        }
+        if lemma_obj
+            .get("split_inf")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            has_split_inf = true;
+        }
+        for paradigm in lemma_obj
+            .get("paradigm_info")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            for s in paradigm
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|tag| tag.as_str())
+            {
+                if !paradigm_tags.contains(&s.to_string()) {
+                    paradigm_tags.push(s.to_string());
+                }
+            }
+            for infl in paradigm
+                .get("inflection")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(wf) = infl.get("word_form").and_then(|v| v.as_str())
+                    && !inflections.contains(&wf.to_string())
+                {
+                    inflections.push(wf.to_string());
+                }
+                for s in infl
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tag| tag.as_str())
+                {
+                    if !inflection_tags.contains(&s.to_string()) {
+                        inflection_tags.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let suggest: Vec<String> = data
+        .get("suggest")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str())
+        .map(String::from)
+        .collect();
+
+    LemmaData {
+        lemmas,
+        suggest,
+        inflections,
+        paradigm_tags,
+        inflection_tags,
+        has_split_inf,
+    }
+}
+
+struct BodyContent {
+    etymology_parts: Vec<String>,
+    etymology_languages: Vec<String>,
+    pronunciation_parts: Vec<String>,
+    dialect_form_parts: Vec<String>,
+    dialect_places: Vec<String>,
+    written_forms: Vec<String>,
+    definition_parts: Vec<String>,
+    example_parts: Vec<String>,
+    sub_article_lemmas: Vec<String>,
+}
+
+/// Extract dialect forms and places from the dialect part of the article.
+fn extract_dialect_content(
+    dialect_arr: &[serde_json::Value],
+    dialect_form_parts: &mut Vec<String>,
+    dialect_places: &mut Vec<String>,
+) {
+    for dialect in dialect_arr {
+        let Some(subcats) = dialect.get("subcats").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for subcat in subcats {
+            let Some(forms) = subcat.get("forms").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for form in forms {
+                if let Some(form_str) = form.get("form").and_then(|v| v.as_str()) {
+                    if !form_str.is_empty() && !dialect_form_parts.contains(&form_str.to_string()) {
+                        dialect_form_parts.push(form_str.to_string());
+                    }
+                } else if let Some(form_obj) = form.get("form").and_then(|v| v.as_object())
+                    && let Some(content) = form_obj.get("content").and_then(|v| v.as_str())
+                    && !content.is_empty()
+                    && !dialect_form_parts.contains(&content.to_string())
+                {
+                    dialect_form_parts.push(content.to_string());
+                }
+                for source in form
+                    .get("sources")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let show = source
+                        .get("show")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    if show == 1
+                        && let Some(name) = source.get("place_name").and_then(|v| v.as_str())
+                        && !dialect_places.contains(&name.to_string())
+                    {
+                        dialect_places.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recursively extract body content from the article.
+fn extract_body_content(data: &serde_json::Value) -> BodyContent {
     let mut etymology_parts = Vec::new();
     let mut etymology_languages = Vec::new();
     let mut pronunciation_parts = Vec::new();
     let mut dialect_form_parts: Vec<String> = Vec::new();
-    let mut has_split_inf = false;
     let mut dialect_places = Vec::new();
+    let mut written_forms: Vec<String> = Vec::new();
     let mut definition_parts = Vec::new();
     let mut example_parts = Vec::new();
-    let mut written_forms: Vec<String> = Vec::new();
     let mut sub_article_lemmas: Vec<String> = Vec::new();
 
-    // Extract lemmas and inflection data
-    if let Some(lemma_arr) = data.get("lemmas").and_then(|v| v.as_array()) {
-        for lemma_obj in lemma_arr {
-            if let Some(lemma_str) = lemma_obj.get("lemma").and_then(|v| v.as_str()) {
-                lemmas.push(lemma_str.to_string());
-            }
-            if lemma_obj
-                .get("split_inf")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                has_split_inf = true;
-            }
-            if let Some(paradigms) = lemma_obj.get("paradigm_info").and_then(|v| v.as_array()) {
-                for paradigm in paradigms {
-                    if let Some(tags) = paradigm.get("tags").and_then(|v| v.as_array()) {
-                        for tag in tags {
-                            if let Some(s) = tag.as_str()
-                                && !paradigm_tags.contains(&s.to_string())
-                            {
-                                paradigm_tags.push(s.to_string());
-                            }
-                        }
-                    }
-                    if let Some(infl_arr) = paradigm.get("inflection").and_then(|v| v.as_array()) {
-                        for infl in infl_arr {
-                            if let Some(wf) = infl.get("word_form").and_then(|v| v.as_str())
-                                && !inflections.contains(&wf.to_string())
-                            {
-                                inflections.push(wf.to_string());
-                            }
-                            if let Some(tags) = infl.get("tags").and_then(|v| v.as_array()) {
-                                for tag in tags {
-                                    if let Some(s) = tag.as_str()
-                                        && !inflection_tags.contains(&s.to_string())
-                                    {
-                                        inflection_tags.push(s.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let body = data.get("body");
 
-    // Extract suggest.
-    if let Some(suggest_arr) = data.get("suggest").and_then(|v| v.as_array()) {
-        for s in suggest_arr {
-            if let Some(st) = s.as_str() {
-                suggest.push(st.to_string());
-            }
-        }
-    }
-
-    // Extract etymology text and languages.
-    let etym_source = data
-        .get("body")
+    // Etymology.
+    for item in body
         .and_then(|b| b.get("etymology"))
-        .and_then(|v| v.as_array());
-    if let Some(etym_arr) = etym_source {
-        for etym in etym_arr {
-            if let Some(items) = etym.get("items").and_then(|v| v.as_array()) {
-                for item in items {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        etymology_parts.push(text.to_string());
-                    }
-                    if item.get("type_").and_then(|v| v.as_str()) == Some("language")
-                        && let Some(id) = item.get("id").and_then(|v| v.as_str())
-                        && !id.is_empty()
-                        && !etymology_languages.contains(&id.to_string())
-                    {
-                        etymology_languages.push(id.to_string());
-                    }
-                }
-            }
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|etym| {
+            etym.get("items")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+        })
+    {
+        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+            etymology_parts.push(text.to_string());
+        }
+        if item.get("type_").and_then(|v| v.as_str()) == Some("language")
+            && let Some(id) = item.get("id").and_then(|v| v.as_str())
+            && !id.is_empty()
+            && !etymology_languages.contains(&id.to_string())
+        {
+            etymology_languages.push(id.to_string());
         }
     }
 
-    // Extract pronunciation text.
-    if let Some(pron_arr) = data
-        .get("body")
+    for content in body
         .and_then(|b| b.get("pronunciation"))
         .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|pron| pron.get("content").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
     {
-        for pron in pron_arr {
-            if let Some(content) = pron.get("content").and_then(|v| v.as_str())
-                && !content.is_empty()
-            {
-                pronunciation_parts.push(content.to_string());
-            }
-        }
+        pronunciation_parts.push(content.to_string());
     }
 
-    if let Some(dialect_arr) = data
-        .get("body")
+    if let Some(dialect_arr) = body
         .and_then(|b| b.get("dialect"))
         .and_then(|v| v.as_array())
     {
-        for dialect in dialect_arr {
-            if let Some(subcats) = dialect.get("subcats").and_then(|v| v.as_array()) {
-                for subcat in subcats {
-                    if let Some(forms) = subcat.get("forms").and_then(|v| v.as_array()) {
-                        for form in forms {
-                            // Extract dialect form text for search.
-                            if let Some(form_str) = form.get("form").and_then(|v| v.as_str()) {
-                                if !form_str.is_empty()
-                                    && !dialect_form_parts.contains(&form_str.to_string())
-                                {
-                                    dialect_form_parts.push(form_str.to_string());
-                                }
-                            } else if let Some(form_obj) =
-                                form.get("form").and_then(|v| v.as_object())
-                                && let Some(content) =
-                                    form_obj.get("content").and_then(|v| v.as_str())
-                                && !content.is_empty()
-                                && !dialect_form_parts.contains(&content.to_string())
-                            {
-                                dialect_form_parts.push(content.to_string());
-                            }
-                            if let Some(sources) = form.get("sources").and_then(|v| v.as_array()) {
-                                for source in sources {
-                                    let show =
-                                        source.get("show").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    // Exclude hidden items, that is, where show isn't 1. Norsk Ordbok
-                                    // doesn't show these in their UI, so it's safe to infer that they
-                                    // shouldn't be used for search results either.
-                                    if show == 1
-                                        && let Some(name) =
-                                            source.get("place_name").and_then(|v| v.as_str())
-                                        && !dialect_places.contains(&name.to_string())
-                                    {
-                                        dialect_places.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        extract_dialect_content(dialect_arr, &mut dialect_form_parts, &mut dialect_places);
     }
 
-    if let Some(wf_arr) = data
-        .get("body")
+    for wf_str in body
         .and_then(|b| b.get("written_form"))
         .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|wf| {
+            wf.get("forms")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|form| form.get("written_form").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
     {
-        for wf in wf_arr {
-            if let Some(forms) = wf.get("forms").and_then(|v| v.as_array()) {
-                for form in forms {
-                    if let Some(wf_str) = form.get("written_form").and_then(|v| v.as_str())
-                        && !wf_str.is_empty()
-                        && !written_forms.contains(&wf_str.to_string())
-                    {
-                        written_forms.push(wf_str.to_string());
-                    }
-                }
-            }
+        if !written_forms.contains(&wf_str.to_string()) {
+            written_forms.push(wf_str.to_string());
         }
     }
 
-    fn extract_definition_content(
-        defs: &[serde_json::Value],
-        def_parts: &mut Vec<String>,
-        ex_parts: &mut Vec<String>,
-        sub_lemmas: &mut Vec<String>,
-    ) {
-        for def in defs {
-            if let Some(elements) = def.get("elements").and_then(|v| v.as_array()) {
-                for element in elements {
-                    let type_ = element.get("type_").and_then(|v| v.as_str()).unwrap_or("");
-                    match type_ {
-                        "explanation" => {
-                            if let Some(content) = element.get("content").and_then(|v| v.as_str())
-                                && !content.is_empty()
-                            {
-                                def_parts.push(content.to_string());
-                            }
-                        }
-                        "example" => {
-                            if let Some(content) = element
-                                .get("quote")
-                                .and_then(|q| q.get("content"))
-                                .and_then(|v| v.as_str())
-                                && !content.is_empty()
-                            {
-                                ex_parts.push(content.to_string());
-                            }
-                        }
-                        "sub_article" => {
-                            if let Some(lemmas_arr) =
-                                element.get("lemmas").and_then(|v| v.as_array())
-                            {
-                                for l in lemmas_arr {
-                                    if let Some(s) = l.as_str()
-                                        && !s.is_empty()
-                                        && !sub_lemmas.contains(&s.to_string())
-                                    {
-                                        sub_lemmas.push(s.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(sub_defs) = def.get("sub_definitions").and_then(|v| v.as_array()) {
-                extract_definition_content(sub_defs, def_parts, ex_parts, sub_lemmas);
-            }
-        }
-    }
-
-    if let Some(defs) = data
-        .get("body")
+    if let Some(defs) = body
         .and_then(|b| b.get("definitions"))
         .and_then(|v| v.as_array())
     {
@@ -703,20 +783,46 @@ pub fn build_search_document(
         );
     }
 
+    BodyContent {
+        etymology_parts,
+        etymology_languages,
+        pronunciation_parts,
+        dialect_form_parts,
+        dialect_places,
+        written_forms,
+        definition_parts,
+        example_parts,
+        sub_article_lemmas,
+    }
+}
+
+/// Build an ArticleSearchDocument from an article.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn build_search_document(
+    dictionary: &str,
+    article_id: i64,
+    data: &serde_json::Value,
+    bibliography: Option<&ArticleBibliography>,
+    place_data: Option<&ArticlePlaceData>,
+) -> ArticleSearchDocument {
+    let lemma_data = extract_lemma_data(data);
+    let body = extract_body_content(data);
+
     ArticleSearchDocument {
         id: format!("{dictionary}_{article_id}"),
         article_id,
         dictionary: dictionary.to_string(),
-        lemmas,
-        suggest,
-        inflections,
-        etymology_text: etymology_parts.join(" "),
-        pronunciation_text: pronunciation_parts.join(" "),
-        dialect_forms: dialect_form_parts,
-        paradigm_tags,
-        inflection_tags,
-        has_split_inf,
-        dialect_places,
+        lemmas: lemma_data.lemmas,
+        suggest: lemma_data.suggest,
+        inflections: lemma_data.inflections,
+        etymology_text: body.etymology_parts.join(" "),
+        pronunciation_text: body.pronunciation_parts.join(" "),
+        dialect_forms: body.dialect_form_parts,
+        paradigm_tags: lemma_data.paradigm_tags,
+        inflection_tags: lemma_data.inflection_tags,
+        has_split_inf: lemma_data.has_split_inf,
+        dialect_places: body.dialect_places,
         older_source_codes: bibliography
             .as_ref()
             .map(|b| b.older_source.codes.clone())
@@ -802,11 +908,11 @@ pub fn build_search_document(
         attestation_place_types: place_data
             .map(|p| p.attestation_types.clone())
             .unwrap_or_default(),
-        etymology_languages,
-        definition_text: definition_parts.join(" "),
-        example_text: example_parts.join(" "),
-        written_forms,
-        sub_article_lemmas,
+        etymology_languages: body.etymology_languages,
+        definition_text: body.definition_parts.join(" "),
+        example_text: body.example_parts.join(" "),
+        written_forms: body.written_forms,
+        sub_article_lemmas: body.sub_article_lemmas,
     }
 }
 
@@ -821,164 +927,173 @@ pub async fn setup_indexes(client: &Client) -> Result<()> {
     }
 
     for dict in ["bm", "nn", "no"] {
-        let idx = index_name(dict);
-        info!("Configuring Meilisearch index '{idx}'…");
-
-        let task = client.create_index(&idx, Some("id")).await?;
-        task.wait_for_completion(client, None, None).await?;
-
-        let index = client.index(&idx);
-
-        let settings = Settings::new()
-            .with_searchable_attributes([
-                "lemmas",
-                "suggest",
-                "inflections",
-                "etymology_text",
-                "pronunciation_text",
-                "dialect_forms",
-                "definition_text",
-                "example_text",
-                "written_forms",
-                "sub_article_lemmas",
-            ])
-            .with_filterable_attributes([
-                "paradigm_tags",
-                "inflection_tags",
-                "has_split_inf",
-                "dialect_places",
-                "place_names",
-                "place_codes",
-                "place_types",
-                "dialect_place_names",
-                "dialect_place_codes",
-                "dialect_place_types",
-                "attestation_place_names",
-                "attestation_place_codes",
-                "attestation_place_types",
-                "older_source_codes",
-                "older_source_authors",
-                "older_source_titles",
-                "older_source_years",
-                "written_form_source_codes",
-                "written_form_source_authors",
-                "written_form_source_titles",
-                "written_form_source_years",
-                "attestation_source_codes",
-                "attestation_source_authors",
-                "attestation_source_titles",
-                "attestation_source_years",
-                "bibliography_codes",
-                "bibliography_authors",
-                "bibliography_titles",
-                "bibliography_years",
-                "etymology_languages",
-                "lemmas",
-                "inflections",
-                "suggest",
-                "dictionary",
-                "article_id",
-                "definition_text",
-                "example_text",
-                "etymology_text",
-                "pronunciation_text",
-                "dialect_forms",
-                "written_forms",
-                "sub_article_lemmas",
-            ])
-            .with_sortable_attributes(["article_id"])
-            .with_ranking_rules([
-                "words",
-                "typo",
-                "proximity",
-                "attribute",
-                "sort",
-                "exactness",
-            ])
-            .with_stop_words(Vec::<String>::new())
-            .with_pagination(meilisearch_sdk::settings::PaginationSetting {
-                max_total_hits: 500_000,
-            })
-            .with_max_values_per_facet(10_000);
-
-        let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(client, None, Some(std::time::Duration::from_secs(600)))
-            .await?;
-
-        info!("Meilisearch index '{idx}' configured.");
+        setup_article_index(client, dict).await?;
     }
+    setup_bibliography_index(client).await?;
+    setup_place_index(client).await?;
 
-    // Configure bibliography index.
-    {
-        info!("Configuring Meilisearch index '{BIBLIOGRAPHY_INDEX}'…");
+    Ok(())
+}
 
-        let task = client.create_index(BIBLIOGRAPHY_INDEX, Some("id")).await?;
-        task.wait_for_completion(client, None, None).await?;
+async fn setup_article_index(client: &Client, dict: &str) -> Result<()> {
+    let idx = index_name(dict);
+    info!("Configuring Meilisearch index '{idx}'…");
 
-        let index = client.index(BIBLIOGRAPHY_INDEX);
+    let task = client.create_index(&idx, Some("id")).await?;
+    task.wait_for_completion(client, None, None).await?;
 
-        let settings = Settings::new()
-            .with_searchable_attributes(["code", "author", "title", "year"])
-            .with_filterable_attributes(["bibl_id", "code", "author", "title", "year"])
-            .with_sortable_attributes(["year", "author"])
-            .with_ranking_rules([
-                "words",
-                "typo",
-                "proximity",
-                "attribute",
-                "sort",
-                "exactness",
-            ])
-            .with_pagination(meilisearch_sdk::settings::PaginationSetting {
-                max_total_hits: 10_000,
-            });
+    let index = client.index(&idx);
 
-        let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(client, None, Some(std::time::Duration::from_secs(60)))
-            .await?;
+    let settings = Settings::new()
+        .with_searchable_attributes([
+            "lemmas",
+            "suggest",
+            "inflections",
+            "etymology_text",
+            "pronunciation_text",
+            "dialect_forms",
+            "definition_text",
+            "example_text",
+            "written_forms",
+            "sub_article_lemmas",
+        ])
+        .with_filterable_attributes([
+            "paradigm_tags",
+            "inflection_tags",
+            "has_split_inf",
+            "dialect_places",
+            "place_names",
+            "place_codes",
+            "place_types",
+            "dialect_place_names",
+            "dialect_place_codes",
+            "dialect_place_types",
+            "attestation_place_names",
+            "attestation_place_codes",
+            "attestation_place_types",
+            "older_source_codes",
+            "older_source_authors",
+            "older_source_titles",
+            "older_source_years",
+            "written_form_source_codes",
+            "written_form_source_authors",
+            "written_form_source_titles",
+            "written_form_source_years",
+            "attestation_source_codes",
+            "attestation_source_authors",
+            "attestation_source_titles",
+            "attestation_source_years",
+            "bibliography_codes",
+            "bibliography_authors",
+            "bibliography_titles",
+            "bibliography_years",
+            "etymology_languages",
+            "lemmas",
+            "inflections",
+            "suggest",
+            "dictionary",
+            "article_id",
+            "definition_text",
+            "example_text",
+            "etymology_text",
+            "pronunciation_text",
+            "dialect_forms",
+            "written_forms",
+            "sub_article_lemmas",
+        ])
+        .with_sortable_attributes(["article_id"])
+        .with_ranking_rules([
+            "words",
+            "typo",
+            "proximity",
+            "attribute",
+            "sort",
+            "exactness",
+        ])
+        .with_stop_words(Vec::<String>::new())
+        .with_pagination(meilisearch_sdk::settings::PaginationSetting {
+            max_total_hits: 500_000,
+        })
+        .with_max_values_per_facet(10_000);
 
-        info!("Meilisearch index '{BIBLIOGRAPHY_INDEX}' configured.");
-    }
+    let task = index.set_settings(&settings).await?;
+    task.wait_for_completion(client, None, Some(std::time::Duration::from_mins(10)))
+        .await?;
 
-    // Configure places index.
-    {
-        info!("Configuring Meilisearch index '{PLACE_INDEX}'…");
+    info!("Meilisearch index '{idx}' configured.");
+    Ok(())
+}
 
-        let task = client.create_index(PLACE_INDEX, Some("id")).await?;
-        task.wait_for_completion(client, None, None).await?;
+/// Set up the bibliography index.
+async fn setup_bibliography_index(client: &Client) -> Result<()> {
+    info!("Configuring Meilisearch index '{BIBLIOGRAPHY_INDEX}'…");
 
-        let index = client.index(PLACE_INDEX);
+    let task = client.create_index(BIBLIOGRAPHY_INDEX, Some("id")).await?;
+    task.wait_for_completion(client, None, None).await?;
 
-        let settings = Settings::new()
-            .with_searchable_attributes(["place_name", "place_name_full", "place_type"])
-            .with_filterable_attributes([
-                "id",
-                "place_name",
-                "place_name_full",
-                "place_type",
-                "parent_id",
-                "municipality_nr",
-            ])
-            .with_sortable_attributes(["place_name"])
-            .with_ranking_rules([
-                "words",
-                "typo",
-                "proximity",
-                "attribute",
-                "sort",
-                "exactness",
-            ])
-            .with_pagination(meilisearch_sdk::settings::PaginationSetting {
-                max_total_hits: 10_000,
-            });
+    let index = client.index(BIBLIOGRAPHY_INDEX);
 
-        let task = index.set_settings(&settings).await?;
-        task.wait_for_completion(client, None, Some(std::time::Duration::from_secs(60)))
-            .await?;
+    let settings = Settings::new()
+        .with_searchable_attributes(["code", "author", "title", "year"])
+        .with_filterable_attributes(["bibl_id", "code", "author", "title", "year"])
+        .with_sortable_attributes(["year", "author"])
+        .with_ranking_rules([
+            "words",
+            "typo",
+            "proximity",
+            "attribute",
+            "sort",
+            "exactness",
+        ])
+        .with_pagination(meilisearch_sdk::settings::PaginationSetting {
+            max_total_hits: 10_000,
+        });
 
-        info!("Meilisearch index '{PLACE_INDEX}' configured.");
-    }
+    let task = index.set_settings(&settings).await?;
+    task.wait_for_completion(client, None, Some(std::time::Duration::from_mins(1)))
+        .await?;
 
+    info!("Meilisearch index '{BIBLIOGRAPHY_INDEX}' configured.");
+    Ok(())
+}
+
+/// Set up the place index.
+async fn setup_place_index(client: &Client) -> Result<()> {
+    info!("Configuring Meilisearch index '{PLACE_INDEX}'…");
+
+    let task = client.create_index(PLACE_INDEX, Some("id")).await?;
+    task.wait_for_completion(client, None, None).await?;
+
+    let index = client.index(PLACE_INDEX);
+
+    let settings = Settings::new()
+        .with_searchable_attributes(["place_name", "place_name_full", "place_type"])
+        .with_filterable_attributes([
+            "id",
+            "place_name",
+            "place_name_full",
+            "place_type",
+            "parent_id",
+            "municipality_nr",
+        ])
+        .with_sortable_attributes(["place_name"])
+        .with_ranking_rules([
+            "words",
+            "typo",
+            "proximity",
+            "attribute",
+            "sort",
+            "exactness",
+        ])
+        .with_pagination(meilisearch_sdk::settings::PaginationSetting {
+            max_total_hits: 10_000,
+        });
+
+    let task = index.set_settings(&settings).await?;
+    task.wait_for_completion(client, None, Some(std::time::Duration::from_mins(1)))
+        .await?;
+
+    info!("Meilisearch index '{PLACE_INDEX}' configured.");
     Ok(())
 }
 
@@ -1005,7 +1120,25 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
         "Meilisearch schema version changed from {current_version} to {MEILI_SCHEMA_VERSION}, re-indexing from PostgreSQL…"
     );
 
-    // Load all bibliography entries for enrichment during reindex.
+    reindex_articles(client, db).await?;
+    reindex_bibliography(client, db).await?;
+    reindex_places(client, db).await?;
+
+    sqlx::query(
+        "INSERT INTO sync_state (dictionary, key, value)
+         VALUES ('_global', 'meili_schema_version', $1)
+         ON CONFLICT (dictionary, key) DO UPDATE SET value = $1",
+    )
+    .bind(MEILI_SCHEMA_VERSION.to_string())
+    .execute(db)
+    .await?;
+
+    info!("Re-index complete. Schema version set to {MEILI_SCHEMA_VERSION}.");
+    Ok(())
+}
+
+/// Re-index all articles from PostgreSQL in Meilisearch.
+async fn reindex_articles(client: &Client, db: &PgPool) -> Result<()> {
     let bib_rows: Vec<(i64, String, String, String, String)> =
         sqlx::query_as("SELECT id, code, author, title, year FROM bibliography")
             .fetch_all(db)
@@ -1092,7 +1225,7 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
             tasks.push(idx.add_or_replace(&batch, Some("id")).await?);
         }
 
-        let timeout = Some(std::time::Duration::from_secs(600));
+        let timeout = Some(std::time::Duration::from_mins(10));
         for task in tasks {
             task.wait_for_completion(client, None, timeout).await?;
         }
@@ -1100,89 +1233,83 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
         info!("  [{dict}] Done.");
     }
 
-    // Re-index bibliography entries.
-    {
-        let idx = client.index(BIBLIOGRAPHY_INDEX);
-        let rows: Vec<(i64, String, String, String, String)> =
-            sqlx::query_as("SELECT id, code, author, title, year FROM bibliography")
-                .fetch_all(db)
-                .await?;
+    Ok(())
+}
 
-        if rows.is_empty() {
-            info!("  [bibliography] No entries in DB, skipping.");
-        } else {
-            info!("  [bibliography] Re-indexing {} entries…", rows.len());
+/// Re-index all bibliography entries from PostgreSQL in Meilisearch.
+async fn reindex_bibliography(client: &Client, db: &PgPool) -> Result<()> {
+    let idx = client.index(BIBLIOGRAPHY_INDEX);
+    let rows: Vec<(i64, String, String, String, String)> =
+        sqlx::query_as("SELECT id, code, author, title, year FROM bibliography")
+            .fetch_all(db)
+            .await?;
 
-            let mut tasks = Vec::new();
-            for chunk in rows.chunks(5000) {
-                let docs: Vec<BibliographySearchDocument> = chunk
-                    .iter()
-                    .map(
-                        |(id, code, author, title, year)| BibliographySearchDocument {
-                            id: *id,
-                            code: code.clone(),
-                            author: author.clone(),
-                            title: title.clone(),
-                            year: year.clone(),
-                        },
-                    )
-                    .collect();
-
-                tasks.push(idx.add_or_replace(&docs, Some("id")).await?);
-            }
-
-            let timeout = Some(std::time::Duration::from_secs(60));
-            for task in tasks {
-                task.wait_for_completion(client, None, timeout).await?;
-            }
-
-            info!("  [bibliography] Done.");
-        }
+    if rows.is_empty() {
+        info!("  [bibliography] No entries in DB, skipping.");
+        return Ok(());
     }
 
-    // Re-index place entries.
-    {
-        let idx = client.index(PLACE_INDEX);
-        let rows: Vec<PlaceSearchDocument> = sqlx::query_as::<_, (i64, String, String, String, Option<i64>, Option<String>)>(
-            "SELECT id, place_name, place_name_full, place_type, parent_id, municipality_nr FROM places",
-        )
-        .fetch_all(db)
-        .await?
-        .into_iter()
-        .map(|(id, place_name, place_name_full, place_type, parent_id, municipality_nr)| {
-            PlaceSearchDocument { id, place_name, place_name_full, place_type, parent_id, municipality_nr }
-        })
-        .collect();
+    info!("  [bibliography] Re-indexing {} entries…", rows.len());
 
-        if rows.is_empty() {
-            info!("  [places] No entries in DB, skipping.");
-        } else {
-            info!("  [places] Re-indexing {} entries…", rows.len());
+    let mut tasks = Vec::new();
+    for chunk in rows.chunks(5000) {
+        let docs: Vec<BibliographySearchDocument> = chunk
+            .iter()
+            .map(
+                |(id, code, author, title, year)| BibliographySearchDocument {
+                    id: *id,
+                    code: code.clone(),
+                    author: author.clone(),
+                    title: title.clone(),
+                    year: year.clone(),
+                },
+            )
+            .collect();
 
-            let mut tasks = Vec::new();
-            for chunk in rows.chunks(5000) {
-                tasks.push(idx.add_or_replace(chunk, Some("id")).await?);
-            }
-
-            let timeout = Some(std::time::Duration::from_secs(60));
-            for task in tasks {
-                task.wait_for_completion(client, None, timeout).await?;
-            }
-
-            info!("  [places] Done.");
-        }
+        tasks.push(idx.add_or_replace(&docs, Some("id")).await?);
     }
 
-    sqlx::query(
-        "INSERT INTO sync_state (dictionary, key, value)
-         VALUES ('_global', 'meili_schema_version', $1)
-         ON CONFLICT (dictionary, key) DO UPDATE SET value = $1",
+    let timeout = Some(std::time::Duration::from_mins(1));
+    for task in tasks {
+        task.wait_for_completion(client, None, timeout).await?;
+    }
+
+    info!("  [bibliography] Done.");
+    Ok(())
+}
+
+/// Re-index all places from PostgreSQL in Meilisearch.
+async fn reindex_places(client: &Client, db: &PgPool) -> Result<()> {
+    let idx = client.index(PLACE_INDEX);
+    let rows: Vec<PlaceSearchDocument> = sqlx::query_as::<_, (i64, String, String, String, Option<i64>, Option<String>)>(
+        "SELECT id, place_name, place_name_full, place_type, parent_id, municipality_nr FROM places",
     )
-    .bind(MEILI_SCHEMA_VERSION.to_string())
-    .execute(db)
-    .await?;
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|(id, place_name, place_name_full, place_type, parent_id, municipality_nr)| {
+        PlaceSearchDocument { id, place_name, place_name_full, place_type, parent_id, municipality_nr }
+    })
+    .collect();
 
-    info!("Re-index complete. Schema version set to {MEILI_SCHEMA_VERSION}.");
+    if rows.is_empty() {
+        info!("  [places] No entries in DB, skipping.");
+        return Ok(());
+    }
+
+    info!("  [places] Re-indexing {} entries…", rows.len());
+
+    let mut tasks = Vec::new();
+    for chunk in rows.chunks(5000) {
+        tasks.push(idx.add_or_replace(chunk, Some("id")).await?);
+    }
+
+    let timeout = Some(std::time::Duration::from_mins(1));
+    for task in tasks {
+        task.wait_for_completion(client, None, timeout).await?;
+    }
+
+    info!("  [places] Done.");
     Ok(())
 }
 
@@ -1396,6 +1523,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_build_search_document_no_with_dialect_and_sources() {
         let data = json!({
             "lemmas": [
