@@ -82,7 +82,7 @@ pub async fn batch_index_articles(
 
     let claimed: Vec<(String, i64)> = sqlx::query_as(
         "UPDATE articles
-         SET sync_status = 'pending_index'
+         SET sync_status = 'pending_index', status_changed_at = now()
          WHERE (dictionary, id) IN (SELECT * FROM UNNEST($1::text[], $2::bigint[]))
            AND sync_status = 'pending_index'
          RETURNING dictionary, id",

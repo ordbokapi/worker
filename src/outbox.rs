@@ -205,7 +205,30 @@ async fn dispatch_job(job_type: &str, payload: &Value, storages: &OutboxStorages
 /// Periodically sweep and retry stuck items.
 #[allow(clippy::too_many_lines)]
 pub async fn run_sweep(db: &PgPool) -> Result<()> {
-    let stale_threshold = chrono::Utc::now() - chrono::Duration::minutes(3);
+    let stale_threshold = chrono::Utc::now() - chrono::Duration::minutes(5);
+
+    // If stuff's been changed recently, the queue is still active, so don't
+    // sweep yet. Wait until nothing's really happening to sweep.
+    let recent_activity: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM articles
+         WHERE sync_status IN ('pending_fetch', 'pending_index')
+           AND status_changed_at > now() - INTERVAL '5 minutes'",
+    )
+    .fetch_one(db)
+    .await?;
+
+    if recent_activity.0 > 50 {
+        debug!(
+            "{} changes in last 5 minutes, skipping sweep.",
+            recent_activity.0
+        );
+
+        sqlx::query("DELETE FROM job_outbox WHERE processed_at < now() - INTERVAL '1 hour'")
+            .execute(db)
+            .await?;
+
+        return Ok(());
+    }
 
     let stuck_fetch: Vec<(String, i64)> = sqlx::query_as(
         "SELECT dictionary, id FROM articles
