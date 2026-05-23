@@ -513,8 +513,10 @@ async fn run(
             .build(handle_sweep)
     });
 
-    // Daily sync at 2 AM.
-    let daily_schedule: Schedule = "0 0 2 * * *".parse()?;
+    // Daily sync at midnight. Can be overriden with the SYNC_SCHEDULE env var.
+    let daily_schedule: Schedule = std::env::var("SYNC_SCHEDULE")
+        .unwrap_or_else(|_| "0 0 0 * * *".to_string())
+        .parse()?;
     let s = svc.clone();
     let t = job_tracker.clone();
     let daily_name = format!("daily-sync-{instance_id}");
