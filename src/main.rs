@@ -698,7 +698,7 @@ async fn handle_daily_sync(
     fetch_dict_metadata_storage: Data<RedisStorage<FetchDictionaryMetadataJob>>,
 ) -> Result<(), Error> {
     let _guard = tracker.track("Daily sync".to_string());
-    info!("2 AM daily sync tasks fired.");
+    info!("Daily sync tasks fired.");
 
     #[cfg(feature = "matrix_notifs")]
     svc.queue_matrix_message("Planlegg daglege synkroniseringsoppgåver.")
