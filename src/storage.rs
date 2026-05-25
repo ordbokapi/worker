@@ -185,7 +185,8 @@ pub async fn store_article(
         .into_iter()
         .collect();
 
-    for bibl_id in &all_bibl_ids {
+    let missing_bibl = filter_missing_ids(&mut tx, "bibliography", &all_bibl_ids).await?;
+    for bibl_id in &missing_bibl {
         write_outbox_fetch_bibl(&mut tx, *bibl_id).await?;
     }
 
@@ -202,11 +203,14 @@ pub async fn store_article(
         Vec::new()
     };
 
-    for place_id in &all_place_ids {
+    let missing_places = filter_missing_ids(&mut tx, "places", &all_place_ids).await?;
+    for place_id in &missing_places {
         write_outbox_fetch_place(&mut tx, *place_id).await?;
     }
 
-    for related_id in &analysis.related_article_ids {
+    let missing_articles =
+        filter_missing_article_ids(&mut tx, dict_str, &analysis.related_article_ids).await?;
+    for related_id in &missing_articles {
         write_outbox_fetch_article(&mut tx, dict_str, *related_id).await?;
     }
 
@@ -217,9 +221,9 @@ pub async fn store_article(
     tx.commit().await?;
 
     Ok(StoreArticleResult {
-        bibl_fetched: all_bibl_ids.len(),
-        places_fetched: all_place_ids.len(),
-        related_fetched: analysis.related_article_ids.len(),
+        bibl_fetched: missing_bibl.len(),
+        places_fetched: missing_places.len(),
+        related_fetched: missing_articles.len(),
     })
 }
 
@@ -608,6 +612,55 @@ pub async fn resolve_inline_place_by_name(
     .await?;
 
     Ok(result.rows_affected())
+}
+
+/// Return IDs from `ids` that don't already exist in the given table.
+async fn filter_missing_ids(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    ids: &[i64],
+) -> Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = match table {
+        "bibliography" => "SELECT id FROM bibliography WHERE id = ANY($1)",
+        "places" => "SELECT id FROM places WHERE id = ANY($1)",
+        _ => return Ok(ids.to_vec()),
+    };
+
+    let existing: Vec<(i64,)> = sqlx::query_as(query).bind(ids).fetch_all(&mut **tx).await?;
+    let existing_set: HashSet<i64> = existing.into_iter().map(|(id,)| id).collect();
+
+    Ok(ids
+        .iter()
+        .copied()
+        .filter(|id| !existing_set.contains(id))
+        .collect())
+}
+
+/// Return article IDs from `ids` that don't already exist for the given dictionary.
+async fn filter_missing_article_ids(
+    tx: &mut Transaction<'_, Postgres>,
+    dict: &str,
+    ids: &[i64],
+) -> Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM articles WHERE dictionary = $1 AND id = ANY($2)")
+            .bind(dict)
+            .bind(ids)
+            .fetch_all(&mut **tx)
+            .await?;
+    let existing_set: HashSet<i64> = existing.into_iter().map(|(id,)| id).collect();
+    Ok(ids
+        .iter()
+        .copied()
+        .filter(|id| !existing_set.contains(id))
+        .collect())
 }
 
 /// Write an outbox entry.
