@@ -28,11 +28,14 @@ apalis-core = "1.0.0-rc.9"
 apalis-redis = "1.0.0-rc.8"
 apalis-cron = "1.0.0-rc.8"
 axum = "0.8.9"
+axum-governor = "2.0.1"
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 cron = "0.16.0"
 base16ct = { version = "1.0.0", features = ["alloc"] }
 futures = "0.3.32"
+hmac = "0.13.0"
+ipnet = "2.12.0"
 meilisearch-sdk = "0.33.0"
 num_cpus = "1.17.0"
 redis = { version = "1.2.1", features = ["aio", "connection-manager", "tokio-comp"] }

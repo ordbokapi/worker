@@ -1,0 +1,71 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Adaline Simonian
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+This file is part of Ordbok API.
+
+Ordbok API is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+Ordbok API is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License
+along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!doctype html>
+<html lang="nn">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Logg inn</title>
+    <style>
+      :root {
+        --color-danger: #c33;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-danger: #f66;
+        }
+      }
+
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 30rem;
+        margin: 0 auto;
+        padding: 3rem 1.5rem;
+      }
+
+      form {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        margin-top: 1rem;
+      }
+
+      .danger {
+        color: var(--color-danger);
+      }
+    </style>
+  </head>
+  <body>
+    <p>Skriv inn passord for å få tilgang:</p>
+    <form id="login-form" method="post" action="/api/login">
+      <input type="password" name="secret" autocomplete="off" />
+      <button type="submit">Logg inn</button>
+    </form>
+    <p id="login-error" class="danger" hidden>Feil passord.</p>
+
+    <script>
+      if (location.search.includes("error=1")) {
+        document.querySelector("#login-error").hidden = false;
+      }
+    </script>
+  </body>
+</html>

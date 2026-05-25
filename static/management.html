@@ -111,251 +111,228 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         display: none;
       }
 
-      #login-form {
-        display: flex;
-        gap: 0.5rem;
-        align-items: center;
-      }
-
       .muted {
         color: var(--color-muted);
       }
     </style>
   </head>
   <body>
-    <div id="login-gate" class="hidden">
-      <h1>Ordbok-API-arbeidarprosessen</h1>
-      <p>Skriv inn passord for å få tilgang:</p>
-      <form id="login-form">
-        <input type="password" id="secret-input" autocomplete="off" />
-        <button type="submit">Logg inn</button>
+    <h1>Ordbok-API-arbeidarprosessen</h1>
+    <div id="no-auth-warning" class="warning hidden">
+      ⚠️ MGMT_UI_SECRET_HASH er ikkje sett. Alle har tilgang. Set
+      miljøvariabelen for å krevja autentisering.
+    </div>
+    <div class="status" id="status">Lastar…</div>
+    <div id="last-update" class="muted"></div>
+
+    <div class="actions">
+      <button id="btn-clear-queues" class="danger">Tøm køar</button>
+      <button id="btn-clear-outbox" class="danger">Tøm utboks</button>
+      <button id="btn-clear-all" class="danger">Tøm alt</button>
+      <button id="btn-pause">⏸ Stopp automatisk oppdatering</button>
+      <form method="post" action="/api/logout" style="margin: 0">
+        <button type="submit">Logg ut</button>
       </form>
-      <p id="login-error" class="hidden danger">Feil passord.</p>
     </div>
 
-    <div id="app" class="hidden">
-      <h1>Ordbok-API-arbeidarprosessen</h1>
-      <div id="no-auth-warning" class="warning hidden">
-        ⚠️ MGMT_UI_SECRET_HASH er ikkje sett. Alle har tilgang. Set
-        miljøvariabelen for å krevja autentisering.
-      </div>
-      <div class="status" id="status">Lastar…</div>
-      <div id="last-update" class="muted"></div>
-
-      <div class="actions">
-        <button id="btn-clear-queues" class="danger">Tøm køar</button>
-        <button id="btn-clear-outbox" class="danger">Tøm utboks</button>
-        <button id="btn-clear-all" class="danger">Tøm alt</button>
-        <button id="btn-pause">⏸ Stopp automatisk oppdatering</button>
-      </div>
-
-      <h2>Synkronisering</h2>
-      <div class="sync-controls">
-        <label
-          ><input type="checkbox" name="dict" value="bm" checked />
-          Bokmålsordboka (bm)</label
-        >
-        <label
-          ><input type="checkbox" name="dict" value="nn" checked />
-          Nynorskordboka (nn)</label
-        >
-        <label
-          ><input type="checkbox" name="dict" value="no" checked /> Norsk Ordbok
-          (no)</label
-        >
-        <button id="btn-sync">Synkroniser</button>
-      </div>
-
-      <h2>Køar</h2>
-      <table id="queue-table">
-        <thead>
-          <tr>
-            <th>Kø</th>
-            <th>På vent</th>
-            <th>Planlagde</th>
-            <th>Mislukka</th>
-            <th>Daude</th>
-            <th>Ferdige</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-
-      <h2>Utboks</h2>
-      <dl class="outbox-stats" id="outbox-stats"></dl>
-
-      <h2>Aktive oppgåver</h2>
-      <ul class="active-jobs" id="active-jobs"></ul>
-
-      <div class="toast" id="toast"></div>
+    <h2>Synkronisering</h2>
+    <div class="sync-controls">
+      <label
+        ><input type="checkbox" name="dict" value="bm" checked /> Bokmålsordboka
+        (bm)</label
+      >
+      <label
+        ><input type="checkbox" name="dict" value="nn" checked /> Nynorskordboka
+        (nn)</label
+      >
+      <label
+        ><input type="checkbox" name="dict" value="no" checked /> Norsk Ordbok
+        (no)</label
+      >
+      <button id="btn-sync">Synkroniser</button>
     </div>
+
+    <h2>Køar</h2>
+    <table id="queue-table">
+      <thead>
+        <tr>
+          <th>Kø</th>
+          <th>På vent</th>
+          <th>Planlagde</th>
+          <th>Mislukka</th>
+          <th>Daude</th>
+          <th>Ferdige</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <h2>Utboks</h2>
+    <dl class="outbox-stats" id="outbox-stats"></dl>
+
+    <h2>Aktive oppgåver</h2>
+    <ul class="active-jobs" id="active-jobs"></ul>
+
+    <div class="toast" id="toast"></div>
 
     <script type="module">
-      let secret = sessionStorage.getItem("mgmt_secret") || "";
-
-      function authHeaders() {
-        const headers = {};
-
-        if (secret) {
-          headers["Authorization"] = `Bearer ${secret}`;
-        }
-
-        return headers;
-      }
-
-      function authedFetch(url, opts = {}) {
-        opts.headers = { ...authHeaders(), ...opts.headers };
-
-        return fetch(url, opts);
-      }
-
-      const loginGate = document.querySelector("#login-gate");
-      const app = document.querySelector("#app");
       const noAuthWarning = document.querySelector("#no-auth-warning");
+      const statusElement = document.querySelector("#status");
+      const lastUpdateElement = document.querySelector("#last-update");
+      const queueBody = document.querySelector("#queue-table tbody");
+      const outboxElement = document.querySelector("#outbox-stats");
+      const activeElement = document.querySelector("#active-jobs");
+      const toastElement = document.querySelector("#toast");
 
-      async function init() {
+      let paused = false;
+      let timer = null;
+      const refreshInterval = 2000;
+
+      {
         const res = await fetch("/api/auth-status");
         const { auth_required } = await res.json();
 
         if (!auth_required) {
           noAuthWarning.classList.remove("hidden");
-          app.classList.remove("hidden");
-
-          startApp();
-
-          return;
         }
+      }
 
-        if (secret) {
-          const test = await authedFetch("/api/stats");
+      const escapeTemplate = document.createElement("template");
 
-          if (test.ok) {
-            app.classList.remove("hidden");
+      function esc(str) {
+        escapeTemplate.content.textContent = String(str);
 
-            startApp();
+        return escapeTemplate.innerHTML;
+      }
 
+      function showToast(msg, isError = false) {
+        toastElement.textContent = msg;
+
+        toastElement.classList.toggle("error", isError);
+        toastElement.classList.add("visible");
+
+        setTimeout(() => toastElement.classList.remove("visible"), 3000);
+      }
+
+      async function fetchStats() {
+        try {
+          const res = await fetch("/api/stats");
+
+          if (res.status === 401) {
+            location.href = "/login";
             return;
           }
 
-          sessionStorage.removeItem("mgmt_secret");
-          secret = "";
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+
+          const data = await res.json();
+
+          render(data);
+
+          statusElement.textContent = "Tilkopla";
+          statusElement.classList.remove("danger");
+
+          lastUpdateElement.textContent = `Sist oppdatert: ${new Date().toLocaleTimeString()}`;
+        } catch (e) {
+          statusElement.textContent = `Feil: ${e.message}`;
+          statusElement.classList.add("danger");
+        }
+      }
+
+      function render({ queues, outbox, active_jobs }) {
+        queueBody.innerHTML = queues
+          .map(
+            (q) => `<tr>
+              <td>${esc(q.namespace.replace("apalis:", ""))}</td>
+              <td class="num">${esc(q.pending)}</td>
+              <td class="num">${esc(q.scheduled)}</td>
+              <td class="num">${esc(q.failed)}</td>
+              <td class="num">${esc(q.dead)}</td>
+              <td class="num">${esc(q.done)}</td>
+            </tr>`,
+          )
+          .join("");
+
+        outboxElement.innerHTML = `
+          <dt>På vent</dt><dd>${esc(outbox.pending)}</dd>
+          <dt>Ferdige (1t)</dt><dd>${esc(outbox.processed_last_hour)}</dd>
+          <dt>Total</dt><dd>${esc(outbox.total)}</dd>`;
+
+        if (active_jobs.length === 0) {
+          activeElement.innerHTML = '<li class="muted">Ingen</li>';
+        } else {
+          activeElement.innerHTML = active_jobs
+            .map((j) => `<li>${esc(j)}</li>`)
+            .join("");
+        }
+      }
+
+      async function doAction(url, btn) {
+        if (!confirm("Er du sikker?")) {
+          return;
         }
 
-        loginGate.classList.remove("hidden");
+        btn.disabled = true;
+
+        try {
+          const res = await fetch(url, { method: "POST" });
+          const data = await res.json();
+
+          showToast(data.message, !data.ok);
+
+          if (!paused) {
+            fetchStats();
+          }
+        } catch (e) {
+          showToast(`Feil: ${e.message}`, true);
+        } finally {
+          btn.disabled = false;
+        }
       }
 
       document
-        .querySelector("#login-form")
-        .addEventListener("submit", async (e) => {
-          e.preventDefault();
+        .querySelector("#btn-clear-queues")
+        .addEventListener("click", (e) =>
+          doAction("/api/clear-queues", e.currentTarget),
+        );
+      document
+        .querySelector("#btn-clear-outbox")
+        .addEventListener("click", (e) =>
+          doAction("/api/clear-outbox", e.currentTarget),
+        );
+      document
+        .querySelector("#btn-clear-all")
+        .addEventListener("click", (e) =>
+          doAction("/api/clear-all", e.currentTarget),
+        );
 
-          const input = document.querySelector("#secret-input");
+      document
+        .querySelector("#btn-sync")
+        .addEventListener("click", async (e) => {
+          const btn = e.currentTarget;
+          const checked = [
+            ...document.querySelectorAll('input[name="dict"]:checked'),
+          ].map((el) => el.value);
 
-          secret = input.value;
-
-          const test = await authedFetch("/api/stats");
-
-          if (test.ok) {
-            sessionStorage.setItem("mgmt_secret", secret);
-
-            loginGate.classList.add("hidden");
-            app.classList.remove("hidden");
-
-            startApp();
-          } else {
-            document.querySelector("#login-error").classList.remove("hidden");
-            secret = "";
+          if (checked.length === 0) {
+            showToast("Vel minst éi ordbok.", true);
+            return;
           }
-        });
 
-      function startApp() {
-        const statusElement = document.querySelector("#status");
-        const lastUpdateElement = document.querySelector("#last-update");
-        const queueBody = document.querySelector("#queue-table tbody");
-        const outboxElement = document.querySelector("#outbox-stats");
-        const activeElement = document.querySelector("#active-jobs");
-        const toastElement = document.querySelector("#toast");
-
-        let paused = false;
-        let timer = null;
-        const refreshInterval = 2000;
-
-        function showToast(msg, isError = false) {
-          toastElement.textContent = msg;
-
-          toastElement.classList.toggle("error", isError);
-          toastElement.classList.add("visible");
-
-          setTimeout(() => toastElement.classList.remove("visible"), 3000);
-        }
-
-        async function fetchStats() {
-          try {
-            const res = await authedFetch("/api/stats");
-
-            if (res.status === 401) {
-              sessionStorage.removeItem("mgmt_secret");
-              location.reload();
-              return;
-            }
-
-            if (!res.ok) {
-              throw new Error(`HTTP ${res.status}`);
-            }
-
-            const data = await res.json();
-
-            render(data);
-
-            statusElement.textContent = "Tilkopla";
-
-            statusElement.classList.remove("danger");
-
-            lastUpdateElement.textContent = `Sist oppdatert: ${new Date().toLocaleTimeString()}`;
-          } catch (e) {
-            statusElement.textContent = `Feil: ${e.message}`;
-
-            statusElement.classList.add("danger");
-          }
-        }
-
-        function render({ queues, outbox, active_jobs }) {
-          queueBody.innerHTML = queues
-            .map(
-              (q) => `<tr>
-                <td>${q.namespace.replace("apalis:", "")}</td>
-                <td class="num">${q.pending}</td>
-                <td class="num">${q.scheduled}</td>
-                <td class="num">${q.failed}</td>
-                <td class="num">${q.dead}</td>
-                <td class="num">${q.done}</td>
-              </tr>`,
-            )
-            .join("");
-
-          outboxElement.innerHTML = `
-            <dt>På vent</dt><dd>${outbox.pending}</dd>
-            <dt>Ferdige (1t)</dt><dd>${outbox.processed_last_hour}</dd>
-            <dt>Total</dt><dd>${outbox.total}</dd>`;
-
-          if (active_jobs.length === 0) {
-            activeElement.innerHTML = '<li class="muted">Ingen</li>';
-          } else {
-            activeElement.innerHTML = active_jobs
-              .map((j) => `<li>${j}</li>`)
-              .join("");
-          }
-        }
-
-        async function doAction(url, btn) {
-          if (!confirm("Er du sikker?")) {
+          if (!confirm(`Synkronisere ${checked.join(", ")}?`)) {
             return;
           }
 
           btn.disabled = true;
 
           try {
-            const res = await authedFetch(url, { method: "POST" });
+            const res = await fetch("/api/sync", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ dictionaries: checked }),
+            });
             const data = await res.json();
 
             showToast(data.message, !data.ok);
@@ -363,88 +340,29 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             if (!paused) {
               fetchStats();
             }
-          } catch (e) {
-            showToast(`Feil: ${e.message}`, true);
+          } catch (err) {
+            showToast(`Feil: ${err.message}`, true);
           } finally {
             btn.disabled = false;
           }
-        }
-
-        document
-          .querySelector("#btn-clear-queues")
-          .addEventListener("click", (e) =>
-            doAction("/api/clear-queues", e.currentTarget),
-          );
-        document
-          .querySelector("#btn-clear-outbox")
-          .addEventListener("click", (e) =>
-            doAction("/api/clear-outbox", e.currentTarget),
-          );
-        document
-          .querySelector("#btn-clear-all")
-          .addEventListener("click", (e) =>
-            doAction("/api/clear-all", e.currentTarget),
-          );
-
-        document
-          .querySelector("#btn-sync")
-          .addEventListener("click", async (e) => {
-            const btn = e.currentTarget;
-            const checked = [
-              ...document.querySelectorAll('input[name="dict"]:checked'),
-            ].map((el) => el.value);
-
-            if (checked.length === 0) {
-              showToast("Vel minst éi ordbok.", true);
-
-              return;
-            }
-
-            if (!confirm(`Synkronisere ${checked.join(", ")}?`)) {
-              return;
-            }
-
-            btn.disabled = true;
-
-            try {
-              const res = await authedFetch("/api/sync", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ dictionaries: checked }),
-              });
-              const data = await res.json();
-
-              showToast(data.message, !data.ok);
-
-              if (!paused) {
-                fetchStats();
-              }
-            } catch (err) {
-              showToast(`Feil: ${err.message}`, true);
-            } finally {
-              btn.disabled = false;
-            }
-          });
-
-        document.querySelector("#btn-pause").addEventListener("click", (e) => {
-          paused = !paused;
-          e.currentTarget.textContent = paused
-            ? "▶ Oppdater automatisk"
-            : "⏸ Stopp automatisk oppdatering";
-
-          if (paused) {
-            clearInterval(timer);
-          } else {
-            fetchStats();
-            timer = setInterval(fetchStats, refreshInterval);
-          }
         });
 
-        fetchStats();
-        timer = setInterval(fetchStats, refreshInterval);
-      }
+      document.querySelector("#btn-pause").addEventListener("click", (e) => {
+        paused = !paused;
+        e.currentTarget.textContent = paused
+          ? "▶ Oppdater automatisk"
+          : "⏸ Stopp automatisk oppdatering";
 
-      init();
+        if (paused) {
+          clearInterval(timer);
+        } else {
+          fetchStats();
+          timer = setInterval(fetchStats, refreshInterval);
+        }
+      });
+
+      fetchStats();
+      timer = setInterval(fetchStats, refreshInterval);
     </script>
   </body>
 </html>

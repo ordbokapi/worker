@@ -19,21 +19,37 @@
 use apalis::prelude::*;
 use axum::{
     Json, Router,
-    extract::Request,
-    http::{StatusCode, header},
+    extract::{DefaultBodyLimit, Request},
+    http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use axum_governor::{GovernorConfigBuilder, GovernorLayer, Quota, extractor::SmartIp, nz};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::jobs::{FetchArticleListJob, FetchDictionaryMetadataJob, QUEUE_NAMESPACES};
 use crate::state::UibDictionary;
 
 pub use apalis_redis::{ConnectionManager, RedisStorage};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SESSION_MAX_AGE: u64 = 60 * 60;
+
+const PRIVATE_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
 
 #[derive(Clone)]
 pub struct WebState {
@@ -43,9 +59,38 @@ pub struct WebState {
     pub fetch_article_list_storage: RedisStorage<FetchArticleListJob>,
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
     pub secret_hash: Option<String>,
+    pub session_key: [u8; 32],
 }
 
-pub fn routes(state: WebState) -> Router {
+pub async fn routes(state: WebState) -> Router {
+    let mut trusted_nets: Vec<ipnet::IpNet> =
+        PRIVATE_CIDRS.iter().map(|s| s.parse().unwrap()).collect();
+
+    if let Ok(cidrs) = std::env::var("TRUSTED_PROXIES") {
+        trusted_nets.extend(
+            cidrs
+                .split(',')
+                .filter_map(|s| s.trim().parse::<ipnet::IpNet>().ok()),
+        );
+    }
+
+    trusted_nets.extend(fetch_proxy_list_urls().await);
+    info!("Trusted proxy CIDRs: {}", trusted_nets.len());
+
+    let smart_ip = SmartIp::new().with_trusted_proxies(trusted_nets);
+
+    let rate_limit = GovernorConfigBuilder::default()
+        .with_extractor(smart_ip)
+        .expect_connect_info()
+        .quota_default(Quota::requests_per_minute(nz!(10u32)))
+        .finish()
+        .unwrap();
+
+    let login_route = Router::new()
+        .route("/api/login", post(login))
+        .layer(GovernorLayer::new(rate_limit))
+        .with_state(state.clone());
+
     let authed = Router::new()
         .route("/api/stats", get(get_stats))
         .route("/api/clear-queues", post(clear_queues))
@@ -56,9 +101,187 @@ pub fn routes(state: WebState) -> Router {
 
     Router::new()
         .route("/", get(serve_ui))
+        .route("/login", get(serve_login))
         .route("/api/auth-status", get(auth_status))
+        .route("/api/logout", post(logout))
+        .merge(login_route)
         .merge(authed)
+        .layer(DefaultBodyLimit::max(4096))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+async fn fetch_proxy_list_urls() -> Vec<ipnet::IpNet> {
+    let urls = match std::env::var("TRUSTED_PROXY_LIST_URLS") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return vec![],
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to build HTTP client for proxy list fetch: {e}");
+            return vec![];
+        }
+    };
+
+    let mut nets = Vec::new();
+
+    for url in urls.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match fetch_single_proxy_list(&client, url).await {
+            Ok(parsed) => {
+                info!("Fetched {} CIDRs from {url}", parsed.len());
+                nets.extend(parsed);
+            }
+            Err(e) => {
+                warn!("Failed to fetch proxy list from {url}: {e}");
+            }
+        }
+    }
+
+    nets
+}
+
+async fn fetch_single_proxy_list(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Vec<ipnet::IpNet>, String> {
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let content_length = resp.content_length().unwrap_or(0);
+
+    if content_length > 1_048_576 {
+        return Err(format!("Response too large: {content_length} bytes"));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+
+    if bytes.len() > 1_048_576 {
+        return Err(format!("Response too large: {} bytes", bytes.len()));
+    }
+
+    let body = String::from_utf8_lossy(&bytes);
+
+    if content_type.contains("application/json") {
+        let ips: Vec<String> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+        Ok(ips
+            .iter()
+            .filter_map(|s| parse_ip_or_cidr(s.trim()))
+            .collect())
+    } else {
+        Ok(body
+            .lines()
+            .filter_map(|line| parse_ip_or_cidr(line.trim()))
+            .collect())
+    }
+}
+
+fn parse_ip_or_cidr(s: &str) -> Option<ipnet::IpNet> {
+    if s.is_empty() {
+        return None;
+    }
+
+    s.parse::<ipnet::IpNet>().ok().or_else(|| {
+        s.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 32).unwrap().into(),
+            std::net::IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 128).unwrap().into(),
+        })
+    })
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
+
+fn create_session_token(key: &[u8]) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + SESSION_MAX_AGE;
+    let exp_str = exp.to_string();
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+
+    mac.update(exp_str.as_bytes());
+
+    let sig = base16ct::lower::encode_string(&mac.finalize().into_bytes());
+
+    format!("{exp_str}.{sig}")
+}
+
+fn verify_session_token(token: &str, key: &[u8]) -> bool {
+    let Some((exp_str, sig_hex)) = token.split_once('.') else {
+        return false;
+    };
+
+    let Ok(exp) = exp_str.parse::<u64>() else {
+        return false;
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if now > exp {
+        return false;
+    }
+
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+
+    mac.update(exp_str.as_bytes());
+
+    let Ok(sig_bytes) = base16ct::lower::decode_vec(sig_hex) else {
+        return false;
+    };
+
+    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+fn extract_cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                let c = c.trim();
+                c.strip_prefix(name)?.strip_prefix('=')
+            })
+        })
 }
 
 async fn require_auth(
@@ -66,19 +289,12 @@ async fn require_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(expected_hash) = &state.secret_hash else {
+    if state.secret_hash.is_none() {
         return next.run(req).await;
-    };
+    }
 
-    let authorized = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|secret| {
-            let hash = base16ct::lower::encode_string(&Sha256::digest(secret.as_bytes()));
-            hash == *expected_hash
-        });
+    let authorized = extract_cookie(req.headers(), "mgmt_session")
+        .is_some_and(|token| verify_session_token(token, &state.session_key));
 
     if authorized {
         next.run(req).await
@@ -100,11 +316,91 @@ async fn auth_status(
     })
 }
 
-async fn serve_ui() -> impl IntoResponse {
+#[derive(Deserialize)]
+struct LoginRequest {
+    secret: String,
+}
+
+async fn login(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    axum::extract::Form(body): axum::extract::Form<LoginRequest>,
+) -> Response {
+    let Some(expected_hash) = &state.secret_hash else {
+        warn!("Login attempt but MGMT_UI_SECRET_HASH is not set");
+        return Redirect::to("/login").into_response();
+    };
+
+    let hash = base16ct::lower::encode_string(&Sha256::digest(body.secret.as_bytes()));
+
+    if hash != *expected_hash {
+        return Redirect::to("/login?error=1").into_response();
+    }
+
+    let token = create_session_token(&state.session_key);
+    let secure = std::env::var("SECURE_COOKIES").map_or(true, |v| v != "0" && v != "false");
+    let secure_flag = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "mgmt_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}{secure_flag}"
+    );
+
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
+}
+
+async fn serve_ui(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    req: Request,
+) -> Response {
+    if state.secret_hash.is_some() {
+        let authorized = extract_cookie(req.headers(), "mgmt_session")
+            .is_some_and(|token| verify_session_token(token, &state.session_key));
+
+        if !authorized {
+            return Redirect::to("/login").into_response();
+        }
+    }
+
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         Html(include_str!("../static/management.html")),
     )
+        .into_response()
+}
+
+async fn serve_login(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    req: Request,
+) -> Response {
+    if state.secret_hash.is_some() {
+        let authorized = extract_cookie(req.headers(), "mgmt_session")
+            .is_some_and(|token| verify_session_token(token, &state.session_key));
+
+        if authorized {
+            return Redirect::to("/").into_response();
+        }
+    }
+
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(include_str!("../static/login.html")),
+    )
+        .into_response()
+}
+
+async fn logout(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    req: Request,
+) -> Response {
+    if state.secret_hash.is_some() {
+        let authorized = extract_cookie(req.headers(), "mgmt_session")
+            .is_some_and(|token| verify_session_token(token, &state.session_key));
+
+        if !authorized {
+            return Redirect::to("/login").into_response();
+        }
+    }
+
+    let cookie = "mgmt_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0";
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/login")).into_response()
 }
 
 #[derive(Serialize)]

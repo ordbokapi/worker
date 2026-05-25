@@ -360,6 +360,7 @@ async fn run(
         fetch_article_list_storage: fetch_article_list_storage.clone(),
         fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
         secret_hash: std::env::var("MGMT_UI_SECRET_HASH").ok(),
+        session_key: rand::random(),
     };
 
     let router = Router::new()
@@ -396,14 +397,19 @@ async fn run(
                 }
             }),
         )
-        .merge(web::routes(web_state));
+        .merge(web::routes(web_state).await);
 
     let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{http_port}");
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         info!("HTTP server listening on port {http_port}");
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     info!("Running database migrations…");
