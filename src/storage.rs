@@ -21,7 +21,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::{HashMap, HashSet};
 
-use crate::extraction::{ArticleAnalysis, InlineRef};
+use crate::extraction::{ArticleAnalysis, ConceptMap, InlineRef};
 use crate::state::{SyncStatus, UibDictionary};
 
 /// Metadata stored in the DB for an article.
@@ -797,4 +797,19 @@ pub async fn write_outbox_batch_index(
         .collect();
     let payload = serde_json::json!({"article_keys": keys});
     write_outbox(tx, "batch_index", key, &payload).await
+}
+
+/// Load the concept map for a dictionary from the `dictionary_metadata` table.
+pub async fn load_concepts(db: &PgPool, dictionary: &str) -> Result<ConceptMap> {
+    let row: Option<(Value,)> = sqlx::query_as(
+        "SELECT data FROM dictionary_metadata WHERE dictionary = $1 AND key = 'concepts'",
+    )
+    .bind(dictionary)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(match row {
+        Some((data,)) => crate::extraction::build_concept_map(&data),
+        None => HashMap::new(),
+    })
 }

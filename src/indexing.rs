@@ -49,12 +49,14 @@ pub async fn index_article(
 
     let bib = load_article_bibliography(db, &article_data).await?;
     let places = load_article_place_data(db, dict, article_id).await?;
+    let concepts = crate::storage::load_concepts(db, dict.as_str()).await?;
     let doc = meili::build_search_document(
         dict.as_str(),
         article_id,
         &article_data,
         Some(&bib),
         Some(&places),
+        &concepts,
     );
 
     let idx = meili.index(meili::index_name(dict.as_str()));
@@ -198,6 +200,7 @@ async fn index_dict_batch(
     bib_map: &HashMap<i64, (String, String, String, String)>,
 ) -> Result<()> {
     let idx = meili.index(meili::index_name(dict));
+    let concepts = crate::storage::load_concepts(db, dict).await?;
     let mut batch: Vec<meili::ArticleSearchDocument> = Vec::with_capacity(5000);
     let mut tasks = Vec::new();
 
@@ -224,6 +227,7 @@ async fn index_dict_batch(
                 data,
                 Some(&bib),
                 Some(&places),
+                &concepts,
             ));
 
             if batch.len() >= 5000 {

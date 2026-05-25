@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Increment this when the indexes change.
-pub const MEILI_SCHEMA_VERSION: i64 = 3;
+pub const MEILI_SCHEMA_VERSION: i64 = 4;
 
 /// The document shape indexed into Meilisearch for search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -696,7 +696,10 @@ fn extract_dialect_content(
 }
 
 /// Recursively extract body content from the article.
-fn extract_body_content(data: &serde_json::Value) -> BodyContent {
+fn extract_body_content(
+    data: &serde_json::Value,
+    concepts: &crate::extraction::ConceptMap,
+) -> BodyContent {
     let mut etymology_parts = Vec::new();
     let mut etymology_languages = Vec::new();
     let mut pronunciation_parts = Vec::new();
@@ -710,27 +713,37 @@ fn extract_body_content(data: &serde_json::Value) -> BodyContent {
     let body = data.get("body");
 
     // Etymology.
-    for item in body
+    for etym in body
         .and_then(|b| b.get("etymology"))
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .flat_map(|etym| {
-            etym.get("items")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-        })
     {
-        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-            etymology_parts.push(text.to_string());
+        if let Some(content) = etym.get("content").and_then(|v| v.as_str()) {
+            let items = etym
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map_or(&[] as &[_], Vec::as_slice);
+            let text = crate::extraction::format_element_text(content, items, concepts);
+            let text = text.trim();
+            if !text.is_empty() {
+                etymology_parts.push(text.to_string());
+            }
         }
-        if item.get("type_").and_then(|v| v.as_str()) == Some("language")
-            && let Some(id) = item.get("id").and_then(|v| v.as_str())
-            && !id.is_empty()
-            && !etymology_languages.contains(&id.to_string())
+
+        for item in etym
+            .get("items")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
         {
-            etymology_languages.push(id.to_string());
+            if item.get("type_").and_then(|v| v.as_str()) == Some("language")
+                && let Some(id) = item.get("id").and_then(|v| v.as_str())
+                && !id.is_empty()
+                && !etymology_languages.contains(&id.to_string())
+            {
+                etymology_languages.push(id.to_string());
+            }
         }
     }
 
@@ -805,9 +818,10 @@ pub fn build_search_document(
     data: &serde_json::Value,
     bibliography: Option<&ArticleBibliography>,
     place_data: Option<&ArticlePlaceData>,
+    concepts: &crate::extraction::ConceptMap,
 ) -> ArticleSearchDocument {
     let lemma_data = extract_lemma_data(data);
-    let body = extract_body_content(data);
+    let body = extract_body_content(data, concepts);
 
     ArticleSearchDocument {
         id: format!("{dictionary}_{article_id}"),
@@ -1188,6 +1202,8 @@ async fn reindex_articles(client: &Client, db: &PgPool) -> Result<()> {
             continue;
         }
 
+        let concepts = crate::storage::load_concepts(db, dict).await?;
+
         info!("  [{dict}] Re-indexing {} articles…", count.0);
 
         let mut stream = sqlx::query_as::<_, (i64, serde_json::Value)>(
@@ -1213,6 +1229,7 @@ async fn reindex_articles(client: &Client, db: &PgPool) -> Result<()> {
                 &data,
                 Some(&bib),
                 Some(&places),
+                &concepts,
             ));
 
             if batch.len() >= 5000 {
@@ -1384,7 +1401,8 @@ mod tests {
             }
         });
 
-        let doc = build_search_document("bm", 55001, &data, None, None);
+        let concepts = std::collections::HashMap::new();
+        let doc = build_search_document("bm", 55001, &data, None, None, &concepts);
 
         assert_eq!(doc.id, "bm_55001");
         assert_eq!(doc.article_id, 55001);
@@ -1455,7 +1473,8 @@ mod tests {
             "suggest": ["F", "f"]
         });
 
-        let doc = build_search_document("bm", 90000, &data, None, None);
+        let concepts = std::collections::HashMap::new();
+        let doc = build_search_document("bm", 90000, &data, None, None, &concepts);
 
         assert_eq!(doc.lemmas, vec!["F", "f"]);
         assert_eq!(doc.suggest, vec!["F", "f"]);
@@ -1494,7 +1513,8 @@ mod tests {
             "suggest": ["velja"]
         });
 
-        let doc = build_search_document("nn", 70001, &data, None, None);
+        let concepts = std::collections::HashMap::new();
+        let doc = build_search_document("nn", 70001, &data, None, None, &concepts);
 
         assert!(doc.has_split_inf);
         assert_eq!(doc.lemmas, vec!["velja"]);
@@ -1506,7 +1526,8 @@ mod tests {
     #[test]
     fn test_build_search_document_empty_data() {
         let data = json!({});
-        let doc = build_search_document("no", 99, &data, None, None);
+        let concepts = std::collections::HashMap::new();
+        let doc = build_search_document("no", 99, &data, None, None, &concepts);
 
         assert_eq!(doc.id, "no_99");
         assert!(doc.lemmas.is_empty());
@@ -1642,7 +1663,8 @@ mod tests {
         );
 
         let bib = build_article_bibliography(&data, &bib_map);
-        let doc = build_search_document("no", 99001, &data, Some(&bib), None);
+        let concepts = std::collections::HashMap::new();
+        let doc = build_search_document("no", 99001, &data, Some(&bib), None, &concepts);
 
         assert_eq!(doc.dialect_places, vec!["Nordfjell", "Vestmark"]);
         assert_eq!(doc.older_source_codes, vec!["FiktA", "FiktB"]);

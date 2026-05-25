@@ -18,7 +18,7 @@
 
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use crate::state::UibDictionary;
@@ -309,6 +309,67 @@ pub fn extract_refs_from_quote(content: &str, refs: &mut Vec<InlineRef>) {
                 spec: spec.map(std::string::ToString::to_string),
             });
         }
+    }
+}
+
+/// Concept map from ID to expansion.
+pub type ConceptMap = HashMap<String, String>;
+
+/// Build a concept map from the raw concepts JSON stored in `dictionary_metadata`.
+#[must_use]
+pub fn build_concept_map(concepts_json: &Value) -> ConceptMap {
+    let mut map = HashMap::new();
+    if let Some(obj) = concepts_json.get("concepts").and_then(|v| v.as_object()) {
+        for (id, entry) in obj {
+            if let Some(expansion) = entry.get("expansion").and_then(|v| v.as_str()) {
+                map.insert(id.clone(), expansion.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Build textContent from a template element.
+#[must_use]
+pub fn format_element_text(content: &str, items: &[Value], concepts: &ConceptMap) -> String {
+    let content = content.strip_prefix("/>").unwrap_or(content);
+
+    let segments: Vec<&str> = content.split('$').collect();
+    let mut result = String::new();
+
+    for (i, segment) in segments.iter().enumerate() {
+        result.push_str(segment);
+        if i >= segments.len() - 1 {
+            continue;
+        }
+        if let Some(item) = items.get(i) {
+            result.push_str(&resolve_item(item, concepts));
+        }
+    }
+
+    result
+}
+
+/// Resolve a single item to its text representation.
+fn resolve_item(item: &Value, concepts: &ConceptMap) -> String {
+    let type_ = item.get("type_").and_then(|v| v.as_str()).unwrap_or("");
+    match type_ {
+        "usage" => item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "language" | "relation" | "entity" => item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map_or_else(String::new, |id| {
+                concepts.get(id).cloned().unwrap_or_else(|| id.to_string())
+            }),
+        _ => item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
