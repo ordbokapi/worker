@@ -47,7 +47,9 @@ pub async fn mark_articles_pending_fetch(
 
     sqlx::query(
         "INSERT INTO articles (dictionary, id, data, sync_status, status_changed_at)
-         SELECT $1, unnest($2::bigint[]), '{}'::jsonb, 'pending_fetch', now()
+         SELECT $1, id, '{}'::jsonb, 'pending_fetch', now()
+         FROM unnest($2::bigint[]) AS id
+         ORDER BY id
          ON CONFLICT (dictionary, id) DO NOTHING",
     )
     .bind(dict_str)
@@ -99,7 +101,9 @@ pub async fn mark_bibl_pending_fetch(
 
     sqlx::query(
         "INSERT INTO bibliography (id, sync_status, status_changed_at)
-         VALUES (unnest($1::bigint[]), 'pending_fetch', now())
+         SELECT id, 'pending_fetch', now()
+         FROM unnest($1::bigint[]) AS id
+         ORDER BY id
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(bibl_ids)
@@ -140,7 +144,9 @@ pub async fn mark_places_pending_fetch(
 
     sqlx::query(
         "INSERT INTO places (id, sync_status, status_changed_at)
-         VALUES (unnest($1::bigint[]), 'pending_fetch', now())
+         SELECT id, 'pending_fetch', now()
+         FROM unnest($1::bigint[]) AS id
+         ORDER BY id
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(place_ids)
