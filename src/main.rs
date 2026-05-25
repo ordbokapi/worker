@@ -27,16 +27,13 @@ mod state;
 mod storage;
 mod sync_service;
 mod uib_client;
+mod web;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Error, Result};
 use apalis::prelude::*;
-use apalis_board::axum::{
-    framework::{ApiBuilder, RegisterRoute},
-    ui::ServeUI,
-};
 use apalis_cron::CronStream;
 use apalis_redis::{ConnectionManager, RedisConfig, RedisStorage};
 use axum::Router;
@@ -61,12 +58,12 @@ use crate::uib_client::UibClient;
 use crate::jobs::SendMatrixMessageJob;
 
 #[derive(Default, Clone)]
-struct JobTracker {
+pub(crate) struct JobTracker {
     inner: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl JobTracker {
-    fn track(&self, description: String) -> JobGuard {
+    pub(crate) fn track(&self, description: String) -> JobGuard {
         self.inner.lock().unwrap().push(description.clone());
         JobGuard {
             tracker: self.clone(),
@@ -74,7 +71,7 @@ impl JobTracker {
         }
     }
 
-    fn active_jobs(&self) -> Vec<String> {
+    pub(crate) fn active_jobs(&self) -> Vec<String> {
         self.inner.lock().unwrap().clone()
     }
 }
@@ -350,21 +347,20 @@ async fn run(
         *matrix_service_opt = Some(ms);
     }
 
+    let job_tracker = JobTracker::default();
+
     let health_db = db.clone();
     let health_redis = redis_conn.clone();
     let health_meili = meili.clone();
 
-    let api = ApiBuilder::new(Router::new())
-        .register(fetch_article_list_storage.clone())
-        .register(fetch_article_storage.clone())
-        .register(index_article_storage.clone())
-        .register(batch_index_storage.clone())
-        .register(fetch_dict_metadata_storage.clone())
-        .register(fetch_bibliography_storage.clone())
-        .register(fetch_place_storage.clone());
-
-    #[cfg(feature = "matrix_notifs")]
-    let api = api.register(matrix_message_storage.clone());
+    let web_state = web::WebState {
+        db: db.clone(),
+        redis_conn: redis_conn.clone(),
+        job_tracker: job_tracker.clone(),
+        fetch_article_list_storage: fetch_article_list_storage.clone(),
+        fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
+        secret_hash: std::env::var("MGMT_UI_SECRET_HASH").ok(),
+    };
 
     let router = Router::new()
         .route(
@@ -400,8 +396,7 @@ async fn run(
                 }
             }),
         )
-        .nest("/api/v1", api.build())
-        .fallback_service(ServeUI::new());
+        .merge(web::routes(web_state));
 
     let http_port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     tokio::spawn(async move {
@@ -476,7 +471,6 @@ async fn run(
     }
 
     let svc = sync_service.clone();
-    let job_tracker = JobTracker::default();
     let article_concurrency = num_workers.clamp(4, 16);
 
     let daily_fal = fetch_article_list_storage.clone();

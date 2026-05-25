@@ -18,6 +18,7 @@
 
 *
 !src
+!static
 !build.rs
 !migrations
 !Cargo.toml
