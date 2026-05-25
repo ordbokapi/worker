@@ -2537,6 +2537,7 @@ dependencies = [
  "anyhow",
  "apalis",
  "apalis-board",
+ "apalis-core",
  "apalis-cron",
  "apalis-redis",
  "assert_cmd",

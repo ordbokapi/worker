@@ -18,7 +18,8 @@
 
 use anyhow::{Result, anyhow};
 use apalis::prelude::*;
-use apalis_redis::RedisStorage;
+use apalis_core::backend::Vacuum;
+use apalis_redis::{ConnectionManager, RedisConfig, RedisStorage};
 use futures::StreamExt;
 use meilisearch_sdk::client::Client as MeiliClient;
 use serde_json::Value;
@@ -47,6 +48,7 @@ pub struct SyncService {
     pub db: PgPool,
     pub meili: MeiliClient,
     pub http: UibClient,
+    pub redis_conn: ConnectionManager,
     pub inline_refs_backfill_count: Arc<AtomicU64>,
     #[cfg(feature = "matrix_notifs")]
     pub matrix_message_storage: RedisStorage<SendMatrixMessageJob>,
@@ -576,7 +578,24 @@ impl SyncService {
 
     /// Handle periodic sweep.
     pub async fn handle_sweep(&self) -> Result<()> {
-        crate::outbox::run_sweep(&self.db).await
+        crate::outbox::run_sweep(&self.db).await?;
+        self.vacuum_queues().await;
+        Ok(())
+    }
+
+    /// Clean up old jobs.
+    async fn vacuum_queues(&self) {
+        for ns in crate::jobs::QUEUE_NAMESPACES {
+            let mut storage = RedisStorage::<()>::new_with_config(
+                self.redis_conn.clone(),
+                RedisConfig::default().set_namespace(ns),
+            );
+            match storage.vacuum().await {
+                Ok(0) => {}
+                Ok(n) => info!("Vacuumed {n} terminal jobs from {ns}"),
+                Err(e) => warn!("Failed to vacuum {ns}: {e}"),
+            }
+        }
     }
 
     /// Check if we need to perform an initial sync for each dictionary.

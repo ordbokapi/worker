@@ -25,6 +25,7 @@ edition = "2024"
 anyhow = "1.0.102"
 apalis = { version = "1.0.0-rc.9", features = ["retry", "timeout", "limit", "catch-panic", "tracing"] }
 apalis-board = { version = "1.0.0-rc.8", features = ["axum", "ui"] }
+apalis-core = "1.0.0-rc.9"
 apalis-redis = "1.0.0-rc.8"
 apalis-cron = "1.0.0-rc.8"
 axum = "0.8.9"

@@ -319,25 +319,28 @@ async fn run(
     let redis_conn = apalis_redis::connect(redis_url).await?;
 
     let fetch_article_list_storage =
-        redis_storage::<FetchArticleListJob>(&redis_conn, "apalis:article-list");
-    let fetch_article_storage = redis_storage::<FetchArticleJob>(&redis_conn, "apalis:article");
+        redis_storage::<FetchArticleListJob>(&redis_conn, FetchArticleListJob::NAMESPACE);
+    let fetch_article_storage =
+        redis_storage::<FetchArticleJob>(&redis_conn, FetchArticleJob::NAMESPACE);
     let index_article_storage =
-        redis_storage::<IndexArticleJob>(&redis_conn, "apalis:index-article");
-    let batch_index_storage = redis_storage::<BatchIndexJob>(&redis_conn, "apalis:batch-index");
-    let fetch_dict_metadata_storage =
-        redis_storage::<FetchDictionaryMetadataJob>(&redis_conn, "apalis:dict-metadata");
+        redis_storage::<IndexArticleJob>(&redis_conn, IndexArticleJob::NAMESPACE);
+    let batch_index_storage = redis_storage::<BatchIndexJob>(&redis_conn, BatchIndexJob::NAMESPACE);
+    let fetch_dict_metadata_storage = redis_storage::<FetchDictionaryMetadataJob>(
+        &redis_conn,
+        FetchDictionaryMetadataJob::NAMESPACE,
+    );
     let fetch_bibliography_storage =
-        redis_storage::<FetchBibliographyJob>(&redis_conn, "apalis:bibliography");
-    let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, "apalis:place");
+        redis_storage::<FetchBibliographyJob>(&redis_conn, FetchBibliographyJob::NAMESPACE);
+    let fetch_place_storage = redis_storage::<FetchPlaceJob>(&redis_conn, FetchPlaceJob::NAMESPACE);
     let backfill_inline_refs_storage =
-        redis_storage::<BackfillInlineRefsJob>(&redis_conn, "apalis:backfill-inline-refs");
+        redis_storage::<BackfillInlineRefsJob>(&redis_conn, BackfillInlineRefsJob::NAMESPACE);
     let resolve_inline_code_storage =
-        redis_storage::<ResolveInlineCodeJob>(&redis_conn, "apalis:resolve-inline-code");
-    let _sweep_storage = redis_storage::<SweepJob>(&redis_conn, "apalis:sweep");
+        redis_storage::<ResolveInlineCodeJob>(&redis_conn, ResolveInlineCodeJob::NAMESPACE);
+    let _sweep_storage = redis_storage::<SweepJob>(&redis_conn, SweepJob::NAMESPACE);
 
     #[cfg(feature = "matrix_notifs")]
     let matrix_message_storage =
-        redis_storage::<SendMatrixMessageJob>(&redis_conn, "apalis:matrix-notify");
+        redis_storage::<SendMatrixMessageJob>(&redis_conn, SendMatrixMessageJob::NAMESPACE);
 
     info!("Connected to Redis.");
 
@@ -423,6 +426,7 @@ async fn run(
         db: db.clone(),
         meili: meili.clone(),
         http: http_client,
+        redis_conn: redis_conn.clone(),
         inline_refs_backfill_count: Arc::new(AtomicU64::new(0)),
         #[cfg(feature = "matrix_notifs")]
         matrix_message_storage: matrix_message_storage.clone(),
