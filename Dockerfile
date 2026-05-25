@@ -17,24 +17,27 @@
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
 # -----------------------------------------
-# Build stage
+# Chef stage
 # -----------------------------------------
-FROM rust:1.95.0 AS builder
-
+FROM rust:1.95.0 AS chef
+RUN cargo install --locked cargo-chef
 WORKDIR /usr/src/ordbokapi-worker
 
-# Copy Cargo.toml and Cargo.lock
-COPY Cargo.toml Cargo.lock ./
+# -----------------------------------------
+# Planner stage
+# -----------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Needed at compile time by sqlx::migrate! macro.
-COPY migrations migrations
+# -----------------------------------------
+# Build stage
+# -----------------------------------------
+FROM chef AS builder
 
-# Create dummy main.rs to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build dependencies
-RUN cargo build --release --features "matrix_notifs sentry_integration"
-RUN rm src/main.rs
+# Cook dependencies
+COPY --from=planner /usr/src/ordbokapi-worker/recipe.json recipe.json
+RUN cargo chef cook --release --features "matrix_notifs sentry_integration" --recipe-path recipe.json
 
 # Copy source code
 COPY . .
