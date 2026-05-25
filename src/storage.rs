@@ -45,11 +45,15 @@ pub async fn mark_articles_pending_fetch(
 
     let dict_str = dict.as_str();
 
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(dict_str)
+        .execute(&mut **tx)
+        .await?;
+
     sqlx::query(
         "INSERT INTO articles (dictionary, id, data, sync_status, status_changed_at)
          SELECT $1, id, '{}'::jsonb, 'pending_fetch', now()
          FROM unnest($2::bigint[]) AS id
-         ORDER BY id
          ON CONFLICT (dictionary, id) DO NOTHING",
     )
     .bind(dict_str)
@@ -99,11 +103,14 @@ pub async fn mark_bibl_pending_fetch(
         return Ok(Vec::new());
     }
 
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('bibliography'))")
+        .execute(&mut **tx)
+        .await?;
+
     sqlx::query(
         "INSERT INTO bibliography (id, sync_status, status_changed_at)
          SELECT id, 'pending_fetch', now()
          FROM unnest($1::bigint[]) AS id
-         ORDER BY id
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(bibl_ids)
@@ -142,11 +149,14 @@ pub async fn mark_places_pending_fetch(
         return Ok(Vec::new());
     }
 
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('places'))")
+        .execute(&mut **tx)
+        .await?;
+
     sqlx::query(
         "INSERT INTO places (id, sync_status, status_changed_at)
          SELECT id, 'pending_fetch', now()
          FROM unnest($1::bigint[]) AS id
-         ORDER BY id
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(place_ids)
