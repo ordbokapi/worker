@@ -29,7 +29,7 @@ mod sync_service;
 mod uib_client;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Error, Result};
 use apalis::prelude::*;
@@ -549,11 +549,40 @@ async fn run(
     };
 
     monitor
-        .on_event(|_ctx, e| {
-            let event_str = format!("{e:?}");
-            if event_str.contains("Error") || event_str.contains("Failed") {
+        .should_restart(|ctx, error, attempt| {
+            if matches!(error, WorkerError::GracefulExit) {
+                return false;
+            }
+            let name = ctx.name();
+            if attempt < 5 {
+                tracing::warn!("Worker {name} failed (attempt {attempt}): {error:?}. Restarting…");
+                true
+            } else {
+                tracing::error!(
+                    "Worker {name} failed after {attempt} restart attempts. Giving up."
+                );
+                false
+            }
+        })
+        .on_event(|ctx, e| match e {
+            Event::Error(_) => {
+                let event_str = format!("{e:?}");
                 tracing::warn!("Worker event: {event_str}");
             }
+            Event::Stop => {
+                let name = ctx.name();
+                if !name.starts_with("sweep-")
+                    && !name.starts_with("daily-sync-")
+                    && !name.starts_with("matrix-notify-")
+                    && !SHUTTING_DOWN.load(Ordering::Relaxed)
+                {
+                    tracing::error!(
+                        "Queue worker {name} stopped unexpectedly. Exiting process for platform restart."
+                    );
+                    std::process::exit(1);
+                }
+            }
+            _ => {}
         })
         .run_with_signal(graceful_shutdown(job_tracker))
         .await?;
@@ -712,8 +741,12 @@ async fn handle_matrix_message(
     Ok(())
 }
 
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
 async fn graceful_shutdown(tracker: JobTracker) -> std::io::Result<()> {
     tokio::signal::ctrl_c().await?;
+
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
 
     info!("Received Ctrl+C, shutting down gracefully...");
 
