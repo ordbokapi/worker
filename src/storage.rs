@@ -33,56 +33,58 @@ pub struct StoredArticleMetadata {
     pub sync_status: SyncStatus,
 }
 
-/// Transition articles to pending fetch.
-pub async fn mark_articles_pending_fetch(
-    tx: &mut Transaction<'_, Postgres>,
-    dict: UibDictionary,
-    article_ids: &[i64],
-) -> Result<Vec<i64>> {
-    if article_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let dict_str = dict.as_str();
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(dict_str)
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query(
+/// Ensure an article row exists with `pending_fetch` status.
+pub async fn ensure_article_pending_fetch(
+    db: &PgPool,
+    dict: &str,
+    article_id: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
         "INSERT INTO articles (dictionary, id, data, sync_status, status_changed_at)
-         SELECT $1, id, '{}'::jsonb, 'pending_fetch', now()
-         FROM unnest($2::bigint[]) AS id
-         ON CONFLICT (dictionary, id) DO NOTHING",
-    )
-    .bind(dict_str)
-    .bind(article_ids)
-    .execute(&mut **tx)
-    .await?;
-
-    let _transitioned: Vec<(i64,)> = sqlx::query_as(
-        "UPDATE articles
+         VALUES ($1, $2, '{}'::jsonb, 'pending_fetch', now())
+         ON CONFLICT (dictionary, id) DO UPDATE
          SET sync_status = 'pending_fetch', status_changed_at = now()
-         WHERE dictionary = $1 AND id = ANY($2) AND sync_status = 'idle'
-         RETURNING id",
+         WHERE articles.sync_status = 'idle'",
     )
-    .bind(dict_str)
-    .bind(article_ids)
-    .fetch_all(&mut **tx)
+    .bind(dict)
+    .bind(article_id)
+    .execute(db)
     .await?;
+    Ok(result.rows_affected() > 0)
+}
 
-    let newly_inserted: Vec<(i64,)> = sqlx::query_as(
-        "SELECT id FROM articles
-         WHERE dictionary = $1 AND id = ANY($2) AND sync_status = 'pending_fetch'",
+/// Ensure a bibliography row exists with `pending_fetch` status.
+pub async fn ensure_bibl_pending_fetch(db: &PgPool, bibl_id: i64) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO bibliography (id, sync_status, status_changed_at)
+         VALUES ($1, 'pending_fetch', now())
+         ON CONFLICT (id) DO UPDATE
+         SET sync_status = 'pending_fetch', status_changed_at = now()
+         WHERE bibliography.sync_status = 'idle'
+            OR (bibliography.sync_status = 'not_found'
+                AND bibliography.status_changed_at < now() - interval '24 hours')",
     )
-    .bind(dict_str)
-    .bind(article_ids)
-    .fetch_all(&mut **tx)
+    .bind(bibl_id)
+    .execute(db)
     .await?;
+    Ok(result.rows_affected() > 0)
+}
 
-    let result: HashSet<i64> = newly_inserted.into_iter().map(|(id,)| id).collect();
-    Ok(result.into_iter().collect())
+/// Ensure a place row exists with `pending_fetch` status.
+pub async fn ensure_place_pending_fetch(db: &PgPool, place_id: i64) -> Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO places (id, sync_status, status_changed_at)
+         VALUES ($1, 'pending_fetch', now())
+         ON CONFLICT (id) DO UPDATE
+         SET sync_status = 'pending_fetch', status_changed_at = now()
+         WHERE places.sync_status = 'idle'
+            OR (places.sync_status = 'not_found'
+                AND places.status_changed_at < now() - interval '24 hours')",
+    )
+    .bind(place_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Mark an entity (bibliography or place) as not found.
@@ -92,97 +94,6 @@ pub async fn mark_entity_not_found(db: &PgPool, table: &str, id: i64) -> Result<
     );
     sqlx::query(&query).bind(id).execute(db).await?;
     Ok(())
-}
-
-/// Mark bibliography entries as pending fetch.
-pub async fn mark_bibl_pending_fetch(
-    tx: &mut Transaction<'_, Postgres>,
-    bibl_ids: &[i64],
-) -> Result<Vec<i64>> {
-    if bibl_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('bibliography'))")
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query(
-        "INSERT INTO bibliography (id, sync_status, status_changed_at)
-         SELECT id, 'pending_fetch', now()
-         FROM unnest($1::bigint[]) AS id
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(bibl_ids)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE bibliography
-         SET sync_status = 'pending_fetch', status_changed_at = now()
-         WHERE id = ANY($1) AND (
-             sync_status = 'idle'
-             OR (sync_status = 'not_found' AND status_changed_at < now() - interval '24 hours')
-         )",
-    )
-    .bind(bibl_ids)
-    .execute(&mut **tx)
-    .await?;
-
-    let result: Vec<(i64,)> = sqlx::query_as(
-        "SELECT id FROM bibliography
-         WHERE id = ANY($1) AND sync_status = 'pending_fetch'",
-    )
-    .bind(bibl_ids)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    Ok(result.into_iter().map(|(id,)| id).collect())
-}
-
-/// Mark place entries as pending fetch.
-pub async fn mark_places_pending_fetch(
-    tx: &mut Transaction<'_, Postgres>,
-    place_ids: &[i64],
-) -> Result<Vec<i64>> {
-    if place_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('places'))")
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query(
-        "INSERT INTO places (id, sync_status, status_changed_at)
-         SELECT id, 'pending_fetch', now()
-         FROM unnest($1::bigint[]) AS id
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(place_ids)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE places
-         SET sync_status = 'pending_fetch', status_changed_at = now()
-         WHERE id = ANY($1) AND (
-             sync_status = 'idle'
-             OR (sync_status = 'not_found' AND status_changed_at < now() - interval '24 hours')
-         )",
-    )
-    .bind(place_ids)
-    .execute(&mut **tx)
-    .await?;
-
-    let result: Vec<(i64,)> = sqlx::query_as(
-        "SELECT id FROM places WHERE id = ANY($1) AND sync_status = 'pending_fetch'",
-    )
-    .bind(place_ids)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    Ok(result.into_iter().map(|(id,)| id).collect())
 }
 
 /// Store a fetched article and its relationships.
@@ -263,6 +174,8 @@ pub async fn store_article(
     )
     .await?;
 
+    write_outbox_index_article(&mut tx, dict_str, article_id).await?;
+
     let all_bibl_ids: Vec<i64> = analysis
         .bibl_ids
         .iter()
@@ -272,7 +185,9 @@ pub async fn store_article(
         .into_iter()
         .collect();
 
-    let bibl_to_fetch = mark_bibl_pending_fetch(&mut tx, &all_bibl_ids).await?;
+    for bibl_id in &all_bibl_ids {
+        write_outbox_fetch_bibl(&mut tx, *bibl_id).await?;
+    }
 
     let all_place_ids: Vec<i64> = if dict == UibDictionary::NorskOrdbok {
         analysis
@@ -287,31 +202,24 @@ pub async fn store_article(
         Vec::new()
     };
 
-    let places_to_fetch = mark_places_pending_fetch(&mut tx, &all_place_ids).await?;
+    for place_id in &all_place_ids {
+        write_outbox_fetch_place(&mut tx, *place_id).await?;
+    }
 
-    let related_to_fetch = if analysis.related_article_ids.is_empty() {
-        Vec::new()
-    } else {
-        mark_articles_pending_fetch(&mut tx, dict, &analysis.related_article_ids).await?
-    };
+    for related_id in &analysis.related_article_ids {
+        write_outbox_fetch_article(&mut tx, dict_str, *related_id).await?;
+    }
 
-    write_store_article_outbox(
-        &mut tx,
-        dict_str,
-        article_id,
-        &bibl_to_fetch,
-        &places_to_fetch,
-        &related_to_fetch,
-        &unresolved_codes,
-    )
-    .await?;
+    for code in &unresolved_codes {
+        write_outbox_resolve_code(&mut tx, code).await?;
+    }
 
     tx.commit().await?;
 
     Ok(StoreArticleResult {
-        bibl_fetched: bibl_to_fetch.len(),
-        places_fetched: places_to_fetch.len(),
-        related_fetched: related_to_fetch.len(),
+        bibl_fetched: all_bibl_ids.len(),
+        places_fetched: all_place_ids.len(),
+        related_fetched: analysis.related_article_ids.len(),
     })
 }
 
@@ -353,34 +261,6 @@ async fn replace_article_place_links(
         .bind(attestation_ids)
         .execute(&mut **tx)
         .await?;
-    }
-
-    Ok(())
-}
-
-/// Write outbox entries for a stored article and its relationships.
-async fn write_store_article_outbox(
-    tx: &mut Transaction<'_, Postgres>,
-    dict_str: &str,
-    article_id: i64,
-    bibl_to_fetch: &[i64],
-    places_to_fetch: &[i64],
-    related_to_fetch: &[i64],
-    unresolved_codes: &[String],
-) -> Result<()> {
-    write_outbox_index_article(&mut *tx, dict_str, article_id).await?;
-
-    for bibl_id in bibl_to_fetch {
-        write_outbox_fetch_bibl(&mut *tx, *bibl_id).await?;
-    }
-    for place_id in places_to_fetch {
-        write_outbox_fetch_place(&mut *tx, *place_id).await?;
-    }
-    for related_id in related_to_fetch {
-        write_outbox_fetch_article(&mut *tx, dict_str, *related_id).await?;
-    }
-    for code in unresolved_codes {
-        write_outbox_resolve_code(&mut *tx, code).await?;
     }
 
     Ok(())

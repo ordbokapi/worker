@@ -84,7 +84,7 @@ async fn poll_once(db: &PgPool, storages: &OutboxStorages) -> Result<()> {
             continue;
         }
 
-        let result = dispatch_job(job_type, payload, storages).await;
+        let result = dispatch_job(db, job_type, payload, storages).await;
 
         match result {
             Ok(()) => processed_ids.push(*id),
@@ -124,7 +124,12 @@ async fn poll_once(db: &PgPool, storages: &OutboxStorages) -> Result<()> {
 }
 
 /// Dispatch a single job to the appropriate Redis queue based on its type.
-async fn dispatch_job(job_type: &str, payload: &Value, storages: &OutboxStorages) -> Result<()> {
+async fn dispatch_job(
+    db: &PgPool,
+    job_type: &str,
+    payload: &Value,
+    storages: &OutboxStorages,
+) -> Result<()> {
     match job_type {
         "fetch_article" => {
             let dictionary = payload["dictionary"]
@@ -132,6 +137,9 @@ async fn dispatch_job(job_type: &str, payload: &Value, storages: &OutboxStorages
                 .unwrap_or_default()
                 .to_string();
             let article_id = payload["article_id"].as_i64().unwrap_or_default();
+            if !crate::storage::ensure_article_pending_fetch(db, &dictionary, article_id).await? {
+                return Ok(());
+            }
             let mut storage = storages.fetch_article.clone();
             storage
                 .push(FetchArticleJob {
@@ -173,6 +181,9 @@ async fn dispatch_job(job_type: &str, payload: &Value, storages: &OutboxStorages
         }
         "fetch_bibliography" => {
             let bibl_id = payload["bibl_id"].as_i64().unwrap_or_default();
+            if !crate::storage::ensure_bibl_pending_fetch(db, bibl_id).await? {
+                return Ok(());
+            }
             let mut storage = storages.fetch_bibliography.clone();
             storage
                 .push(FetchBibliographyJob { bibl_id })
@@ -181,6 +192,9 @@ async fn dispatch_job(job_type: &str, payload: &Value, storages: &OutboxStorages
         }
         "fetch_place" => {
             let place_id = payload["place_id"].as_i64().unwrap_or_default();
+            if !crate::storage::ensure_place_pending_fetch(db, place_id).await? {
+                return Ok(());
+            }
             let mut storage = storages.fetch_place.clone();
             storage
                 .push(FetchPlaceJob { place_id })

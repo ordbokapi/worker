@@ -157,19 +157,14 @@ impl SyncService {
         }
 
         let mut tx = self.db.begin().await?;
-        let marked = storage::mark_articles_pending_fetch(&mut tx, dict, &to_fetch).await?;
 
-        for article_id in &marked {
+        for article_id in &to_fetch {
             storage::write_outbox_fetch_article(&mut tx, dict.as_str(), *article_id).await?;
         }
 
         tx.commit().await?;
 
-        info!(
-            "[{dict}] Enqueued {} article fetch jobs, {} already in flight.",
-            marked.len(),
-            to_fetch.len() - marked.len()
-        );
+        info!("[{dict}] Enqueued {} article fetch jobs.", to_fetch.len(),);
 
         #[cfg(feature = "matrix_notifs")]
         {
@@ -586,14 +581,31 @@ impl SyncService {
     /// Clean up old jobs.
     async fn vacuum_queues(&self) {
         for ns in crate::jobs::QUEUE_NAMESPACES {
-            let mut storage = RedisStorage::<()>::new_with_config(
-                self.redis_conn.clone(),
-                RedisConfig::default().set_namespace(ns),
-            );
+            let config = RedisConfig::default().set_namespace(ns);
+            let mut storage =
+                RedisStorage::<()>::new_with_config(self.redis_conn.clone(), config.clone());
             match storage.vacuum().await {
                 Ok(0) => {}
                 Ok(n) => info!("Vacuumed {n} terminal jobs from {ns}"),
                 Err(e) => warn!("Failed to vacuum {ns}: {e}"),
+            }
+
+            // Apalis only cleans data and metadata, but not the sorted sets
+            // that track completed jobs.
+            let sets = [
+                config.done_jobs_set(),
+                config.dead_jobs_set(),
+                config.failed_jobs_set(),
+            ];
+            let mut conn = self.redis_conn.clone();
+            for set_key in &sets {
+                let removed: Result<u64, _> =
+                    redis::cmd("DEL").arg(set_key).query_async(&mut conn).await;
+                match removed {
+                    Ok(1) => debug!("Cleared sorted set {set_key}"),
+                    Ok(_) => {}
+                    Err(e) => warn!("Failed to clear {set_key}: {e}"),
+                }
             }
         }
     }
@@ -679,13 +691,12 @@ impl SyncService {
         };
 
         let mut tx = self.db.begin().await?;
-        let to_fetch = storage::mark_bibl_pending_fetch(&mut tx, &ids).await?;
-        for id in &to_fetch {
+        for id in &ids {
             storage::write_outbox_fetch_bibl(&mut tx, *id).await?;
         }
         tx.commit().await?;
 
-        info!("Enqueued {} bibliography fetch jobs.", to_fetch.len());
+        info!("Enqueued {} bibliography fetch jobs.", ids.len());
         Ok(())
     }
 
@@ -704,13 +715,12 @@ impl SyncService {
         };
 
         let mut tx = self.db.begin().await?;
-        let to_fetch = storage::mark_places_pending_fetch(&mut tx, &ids).await?;
-        for id in &to_fetch {
+        for id in &ids {
             storage::write_outbox_fetch_place(&mut tx, *id).await?;
         }
         tx.commit().await?;
 
-        info!("Enqueued {} place fetch jobs.", to_fetch.len());
+        info!("Enqueued {} place fetch jobs.", ids.len());
         Ok(())
     }
 
@@ -875,8 +885,7 @@ impl SyncService {
         if !child_ids.is_empty() {
             let child_vec: Vec<i64> = child_ids.into_iter().collect();
             let mut tx = self.db.begin().await?;
-            let to_fetch = storage::mark_places_pending_fetch(&mut tx, &child_vec).await?;
-            for place_id in &to_fetch {
+            for place_id in &child_vec {
                 storage::write_outbox_fetch_place(&mut tx, *place_id).await?;
             }
             tx.commit().await?;
