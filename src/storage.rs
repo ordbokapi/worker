@@ -619,8 +619,11 @@ async fn write_outbox(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO job_outbox (job_type, job_key, payload)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (job_type, job_key) WHERE processed_at IS NULL DO NOTHING",
+         SELECT $1, $2, $3
+         WHERE NOT EXISTS (
+             SELECT 1 FROM job_outbox
+             WHERE job_type = $1 AND job_key = $2 AND processed_at IS NULL
+         )",
     )
     .bind(job_type)
     .bind(key)
