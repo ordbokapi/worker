@@ -1390,7 +1390,7 @@ mod tests {
                 "etymology": [
                     {
                         "type_": "etymology_language",
-                        "content": "av norrønt $",
+                        "content": "av norrønt $ $",
                         "items": [
                             { "type_": "usage", "text": "fjǫrðr" },
                             { "type_": "usage", "text": "þing" },
@@ -1421,7 +1421,7 @@ mod tests {
         );
         assert_eq!(doc.paradigm_tags, vec!["NOUN", "Masc", "Fem"]);
         assert_eq!(doc.inflection_tags, vec!["Sing", "Ind", "Def", "Plur"]);
-        assert_eq!(doc.etymology_text, "fjǫrðr þing");
+        assert_eq!(doc.etymology_text, "av norrønt fjǫrðr þing");
         assert!(!doc.has_split_inf);
         assert!(doc.dialect_places.is_empty());
         assert!(doc.older_source_codes.is_empty());
