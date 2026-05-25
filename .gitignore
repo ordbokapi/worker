@@ -22,3 +22,4 @@
 .valkey*
 .env
 ordbokapi-dump.sql
+misc-scripts
