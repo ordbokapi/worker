@@ -53,7 +53,18 @@ RUN cargo build --release --features "matrix_notifs sentry_integration"
 FROM debian:stable-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y tini ca-certificates curl postgresql-client && rm -rf /var/lib/apt/lists/* && update-ca-certificates
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends tini ca-certificates curl gnupg \
+	&& install -d /usr/share/postgresql-common/pgdg \
+	&& curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg \
+	&& . /etc/os-release \
+	&& echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends postgresql-client-18 \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& update-ca-certificates
+
+ENV PG_DUMP_BIN=/usr/lib/postgresql/18/bin/pg_dump
 
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker
