@@ -481,7 +481,13 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         <span class="spacer"></span>
         <span id="last-update" class="muted"></span>
         <button id="btn-pause">⏸ Pause</button>
-        <form method="post" action="/api/logout" style="margin: 0">
+        <form
+          method="post"
+          action="/api/logout"
+          id="logout-form"
+          style="margin: 0"
+          class="hidden"
+        >
           <button type="submit">Logg ut</button>
         </form>
       </div>
@@ -785,6 +791,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
         if (!auth_required) {
           noAuthWarning.classList.remove("hidden");
+        } else {
+          document.querySelector("#logout-form").classList.remove("hidden");
         }
       }
 
