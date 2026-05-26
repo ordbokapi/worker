@@ -23,6 +23,7 @@ mod jobs;
 mod matrix_notify_service;
 mod meili;
 mod outbox;
+mod snapshot;
 mod state;
 mod storage;
 mod sync_service;
@@ -50,6 +51,7 @@ use crate::jobs::{
     FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, ResolveInlineCodeJob,
     SweepJob,
 };
+use crate::snapshot::SnapshotConfig;
 use crate::state::UibDictionary;
 use crate::sync_service::SyncService;
 use crate::uib_client::UibClient;
@@ -250,6 +252,10 @@ async fn run(
                             .action(clap::ArgAction::Append),
                     ),
             )
+            .subcommand(
+                clap::Command::new("reindex")
+                    .about("Rebuild Meilisearch indexes from PostgreSQL and then exit"),
+            )
             .get_matches();
 
     let log_level = matches
@@ -287,6 +293,7 @@ async fn run(
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost:5432/ordbokapi".to_string());
+    let snapshot_config = SnapshotConfig::from_env(&database_url)?;
     info!("Connecting to PostgreSQL…");
 
     let db = PgPoolOptions::new()
@@ -305,6 +312,20 @@ async fn run(
     );
 
     let meili = MeiliClient::new(&meili_url, meili_key.as_deref())?;
+
+    let is_reindex = matches!(matches.subcommand_name(), Some("reindex"));
+    if is_reindex {
+        info!("Running database migrations…");
+        sqlx::migrate!("./migrations").run(&db).await?;
+        info!("Migrations complete.");
+
+        meili::setup_indexes(&meili).await?;
+        info!("Meilisearch indexes configured.");
+
+        meili::reindex_all(&meili, &db).await?;
+        info!("Explicit reindex complete.");
+        return Ok(());
+    }
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -560,6 +581,25 @@ async fn run(
             .build(handle_daily_sync)
     });
 
+    let monitor = if let Some(snapshot_config) = snapshot_config.clone() {
+        info!("Snapshot publishing enabled.");
+        let s = svc.clone();
+        let t = job_tracker.clone();
+        let snapshot_name = format!("publish-snapshot-{instance_id}");
+        let snapshot_schedule: Schedule = snapshot::POLL_SCHEDULE.parse()?;
+        monitor.register(move |_| {
+            WorkerBuilder::new(&snapshot_name)
+                .backend(CronStream::new(snapshot_schedule.clone()))
+                .data(s.clone())
+                .data(t.clone())
+                .data(snapshot_config.clone())
+                .build(handle_publish_snapshot)
+        })
+    } else {
+        info!("Snapshot publishing disabled, snapshot S3 env vars not configured.");
+        monitor
+    };
+
     #[cfg(feature = "matrix_notifs")]
     let monitor = {
         let ms = matrix_service_opt
@@ -756,6 +796,18 @@ async fn handle_daily_sync(
         }
     }
     Ok(())
+}
+
+async fn handle_publish_snapshot(
+    _event: apalis_cron::Tick,
+    svc: Data<SyncService>,
+    tracker: Data<JobTracker>,
+    snapshot_config: Data<SnapshotConfig>,
+) -> Result<(), Error> {
+    let _guard = tracker.track("Publish snapshot".to_string());
+    snapshot_config
+        .maybe_publish(&svc.db, &svc.redis_conn, &tracker.active_jobs())
+        .await
 }
 
 #[cfg(feature = "matrix_notifs")]

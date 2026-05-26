@@ -53,7 +53,7 @@ RUN cargo build --release --features "matrix_notifs sentry_integration"
 FROM debian:stable-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y tini ca-certificates curl && rm -rf /var/lib/apt/lists/* && update-ca-certificates
+RUN apt-get update && apt-get install -y tini ca-certificates curl postgresql-client && rm -rf /var/lib/apt/lists/* && update-ca-certificates
 
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker

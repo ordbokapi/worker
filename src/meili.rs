@@ -455,6 +455,15 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
         "Meilisearch schema version changed from {current_version} to {MEILI_SCHEMA_VERSION}, re-indexing from PostgreSQL…"
     );
 
+    reindex_all(client, db).await?;
+
+    info!("Re-index complete. Schema version set to {MEILI_SCHEMA_VERSION}.");
+    Ok(())
+}
+
+/// Re-index all Meilisearch data from PostgreSQL and save the current schema
+/// version.
+pub async fn reindex_all(client: &Client, db: &PgPool) -> Result<()> {
     reindex_articles(client, db).await?;
     reindex_bibliography(client, db).await?;
     reindex_places(client, db).await?;
@@ -468,7 +477,6 @@ pub async fn reindex_if_needed(client: &Client, db: &PgPool) -> Result<()> {
     .execute(db)
     .await?;
 
-    info!("Re-index complete. Schema version set to {MEILI_SCHEMA_VERSION}.");
     Ok(())
 }
 
