@@ -448,6 +448,14 @@ async fn run(
         fetch_bibliography: fetch_bibliography_storage.clone(),
         fetch_place: fetch_place_storage.clone(),
         resolve_inline_code: resolve_inline_code_storage.clone(),
+        redis_conn: redis_conn.clone(),
+        watermarks: outbox::Watermarks::from_concurrency(
+            i64::try_from(num_workers.clamp(4, 16)).unwrap_or(16),
+            2,
+            4,
+            4,
+            2,
+        ),
     };
     tokio::spawn(async move {
         outbox::run_outbox_poller(outbox_db, outbox_storages).await;
