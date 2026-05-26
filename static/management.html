@@ -594,8 +594,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             <tr>
               <th>Kø</th>
               <th class="num">På vent</th>
-              <th class="num">I gang</th>
               <th class="num">Planlagde</th>
+              <th class="num">I gang</th>
               <th class="num">Mislukka</th>
               <th class="num">Daude</th>
               <th class="num">Ferdige</th>
@@ -919,8 +919,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
           setCell(row.cells[0], q.namespace);
           setCell(row.cells[1], q.pending, true);
-          setCell(row.cells[2], q.running, true, "neutral");
-          setCell(row.cells[3], q.scheduled, true, "neutral");
+          setCell(row.cells[2], q.scheduled, true, "neutral");
+          setCell(row.cells[3], q.running, true, "neutral");
           setCell(row.cells[4], q.failed, true);
           setCell(row.cells[5], q.dead, true);
           setCell(row.cells[6], q.done, true, "neutral");
