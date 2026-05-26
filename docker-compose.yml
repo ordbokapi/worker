@@ -34,6 +34,7 @@ services:
     environment:
       MEILI_MASTER_KEY: ${MEILI_API_KEY:-masterkey}
       MEILI_ENV: development
+      MEILI_EXPERIMENTAL_CONTAINS_FILTER: "true"
     ports:
       - "${MEILI_PORT:-7700}:7700"
     volumes:
