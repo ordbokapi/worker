@@ -47,8 +47,8 @@ use tracing::{error, info, warn};
 
 use crate::jobs::{
     BackfillInlineRefsJob, BatchIndexJob, FetchArticleJob, FetchArticleListJob,
-    FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, IndexArticleJob,
-    ResolveInlineCodeJob, SweepJob,
+    FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, ResolveInlineCodeJob,
+    SweepJob,
 };
 use crate::state::UibDictionary;
 use crate::sync_service::SyncService;
@@ -319,8 +319,6 @@ async fn run(
         redis_storage::<FetchArticleListJob>(&redis_conn, FetchArticleListJob::NAMESPACE);
     let fetch_article_storage =
         redis_storage::<FetchArticleJob>(&redis_conn, FetchArticleJob::NAMESPACE);
-    let index_article_storage =
-        redis_storage::<IndexArticleJob>(&redis_conn, IndexArticleJob::NAMESPACE);
     let batch_index_storage = redis_storage::<BatchIndexJob>(&redis_conn, BatchIndexJob::NAMESPACE);
     let fetch_dict_metadata_storage = redis_storage::<FetchDictionaryMetadataJob>(
         &redis_conn,
@@ -333,7 +331,7 @@ async fn run(
         redis_storage::<BackfillInlineRefsJob>(&redis_conn, BackfillInlineRefsJob::NAMESPACE);
     let resolve_inline_code_storage =
         redis_storage::<ResolveInlineCodeJob>(&redis_conn, ResolveInlineCodeJob::NAMESPACE);
-    let _sweep_storage = redis_storage::<SweepJob>(&redis_conn, SweepJob::NAMESPACE);
+    let sweep_storage = redis_storage::<SweepJob>(&redis_conn, SweepJob::NAMESPACE);
 
     #[cfg(feature = "matrix_notifs")]
     let matrix_message_storage =
@@ -353,14 +351,24 @@ async fn run(
     let health_redis = redis_conn.clone();
     let health_meili = meili.clone();
 
+    #[cfg(feature = "dev_ui")]
+    let reload_tx = {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        web::spawn_static_watcher(tx.clone());
+        tx
+    };
+
     let web_state = web::WebState {
         db: db.clone(),
         redis_conn: redis_conn.clone(),
         job_tracker: job_tracker.clone(),
+        sweep_storage: sweep_storage.clone(),
         fetch_article_list_storage: fetch_article_list_storage.clone(),
         fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
         secret_hash: std::env::var("MGMT_UI_SECRET_HASH").ok(),
         session_key: rand::random(),
+        #[cfg(feature = "dev_ui")]
+        reload_tx,
     };
 
     let router = Router::new()
@@ -436,7 +444,6 @@ async fn run(
     let outbox_db = db.clone();
     let outbox_storages = outbox::OutboxStorages {
         fetch_article: fetch_article_storage.clone(),
-        index_article: index_article_storage.clone(),
         batch_index: batch_index_storage.clone(),
         fetch_bibliography: fetch_bibliography_storage.clone(),
         fetch_place: fetch_place_storage.clone(),
@@ -495,7 +502,6 @@ async fn run(
     let monitor = register_workers!(Monitor::new(), svc, job_tracker, retry_policy, &instance_id,
         "fetch-article-list" => fetch_article_list_storage, 1, handle_fetch_article_list;
         "fetch-article" => fetch_article_storage, article_concurrency, handle_fetch_article;
-        "index-article" => index_article_storage, article_concurrency, handle_index_article;
         "batch-index" => batch_index_storage, 2, handle_batch_index;
         "fetch-dict-metadata" => fetch_dict_metadata_storage, 3, handle_fetch_dict_metadata;
         "fetch-bibliography" => fetch_bibliography_storage, 4, handle_fetch_bibliography;
@@ -515,6 +521,18 @@ async fn run(
             .data(s.clone())
             .data(t.clone())
             .build(handle_sweep)
+    });
+
+    // Handle manual sweep requests.
+    let s = svc.clone();
+    let t = job_tracker.clone();
+    let sweep_queue_name = format!("sweep-queue-{instance_id}");
+    let monitor = monitor.register(move |_| {
+        WorkerBuilder::new(&sweep_queue_name)
+            .backend(sweep_storage.clone())
+            .data(s.clone())
+            .data(t.clone())
+            .build(handle_sweep_queued)
     });
 
     // Daily sync at midnight. Can be overriden with the SYNC_SCHEDULE env var.
@@ -615,18 +633,6 @@ async fn handle_fetch_article(
     svc.handle_fetch_article(job).await
 }
 
-async fn handle_index_article(
-    job: IndexArticleJob,
-    svc: Data<SyncService>,
-    tracker: Data<JobTracker>,
-) -> Result<(), Error> {
-    let _guard = tracker.track(format!(
-        "Indexing article {}:{}",
-        job.dictionary, job.article_id
-    ));
-    svc.handle_index_article(job).await
-}
-
 async fn handle_batch_index(
     job: BatchIndexJob,
     svc: Data<SyncService>,
@@ -693,6 +699,15 @@ async fn handle_sweep(
     tracker: Data<JobTracker>,
 ) -> Result<(), Error> {
     let _guard = tracker.track("Sweep stuck items".to_string());
+    svc.handle_sweep().await
+}
+
+async fn handle_sweep_queued(
+    _job: SweepJob,
+    svc: Data<SyncService>,
+    tracker: Data<JobTracker>,
+) -> Result<(), Error> {
+    let _guard = tracker.track("Sweep stuck items (manually triggered)".to_string());
     svc.handle_sweep().await
 }
 

@@ -24,6 +24,9 @@ use std::collections::{HashMap, HashSet};
 use crate::extraction::{ArticleAnalysis, ConceptMap, InlineRef};
 use crate::state::{SyncStatus, UibDictionary};
 
+/// Maps articles to location data.
+pub type ArticlePlaceMap = HashMap<String, HashMap<i64, (Vec<i64>, Vec<i64>)>>;
+
 /// Metadata stored in the DB for an article.
 #[derive(Debug)]
 pub struct StoredArticleMetadata {
@@ -53,38 +56,46 @@ pub async fn ensure_article_pending_fetch(
     Ok(result.rows_affected() > 0)
 }
 
-/// Ensure a bibliography row exists with `pending_fetch` status.
-pub async fn ensure_bibl_pending_fetch(db: &PgPool, bibl_id: i64) -> Result<bool> {
-    let result = sqlx::query(
-        "INSERT INTO bibliography (id, sync_status, status_changed_at)
+/// Reset an article to idle.
+pub async fn reset_article_to_idle(
+    db: &PgPool,
+    dict: UibDictionary,
+    article_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE articles SET sync_status = 'idle', status_changed_at = now()
+         WHERE dictionary = $1 AND id = $2 AND sync_status != 'idle'",
+    )
+    .bind(dict.as_str())
+    .bind(article_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Ensure a bibliography or place row exists with `pending_fetch` status.
+async fn ensure_entity_pending_fetch(db: &PgPool, table: &str, entity_id: i64) -> Result<bool> {
+    let query = format!(
+        "INSERT INTO {table} (id, sync_status, status_changed_at)
          VALUES ($1, 'pending_fetch', now())
          ON CONFLICT (id) DO UPDATE
          SET sync_status = 'pending_fetch', status_changed_at = now()
-         WHERE bibliography.sync_status = 'idle'
-            OR (bibliography.sync_status = 'not_found'
-                AND bibliography.status_changed_at < now() - interval '24 hours')",
-    )
-    .bind(bibl_id)
-    .execute(db)
-    .await?;
+         WHERE {table}.sync_status = 'idle'
+            OR ({table}.sync_status = 'not_found'
+                AND {table}.status_changed_at < now() - interval '24 hours')"
+    );
+    let result = sqlx::query(&query).bind(entity_id).execute(db).await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Ensure a bibliography row exists with `pending_fetch` status.
+pub async fn ensure_bibl_pending_fetch(db: &PgPool, bibl_id: i64) -> Result<bool> {
+    ensure_entity_pending_fetch(db, "bibliography", bibl_id).await
 }
 
 /// Ensure a place row exists with `pending_fetch` status.
 pub async fn ensure_place_pending_fetch(db: &PgPool, place_id: i64) -> Result<bool> {
-    let result = sqlx::query(
-        "INSERT INTO places (id, sync_status, status_changed_at)
-         VALUES ($1, 'pending_fetch', now())
-         ON CONFLICT (id) DO UPDATE
-         SET sync_status = 'pending_fetch', status_changed_at = now()
-         WHERE places.sync_status = 'idle'
-            OR (places.sync_status = 'not_found'
-                AND places.status_changed_at < now() - interval '24 hours')",
-    )
-    .bind(place_id)
-    .execute(db)
-    .await?;
-    Ok(result.rows_affected() > 0)
+    ensure_entity_pending_fetch(db, "places", place_id).await
 }
 
 /// Mark an entity (bibliography or place) as not found.
@@ -357,24 +368,31 @@ pub async fn store_place(db: &PgPool, place_id: i64, entry: &Value) -> Result<()
     Ok(())
 }
 
+/// Mark articles that depend on an entity for re-indexing.
+async fn mark_articles_for_reindex(
+    db: &PgPool,
+    join_table: &str,
+    entity_column: &str,
+    entity_id: i64,
+) -> Result<Vec<(String, i64)>> {
+    let query = format!(
+        "UPDATE articles a
+         SET sync_status = 'pending_index', status_changed_at = now()
+         FROM {join_table} j
+         WHERE a.dictionary = j.dictionary AND a.id = j.article_id
+           AND j.{entity_column} = $1 AND a.sync_status = 'idle'
+         RETURNING a.dictionary, a.id"
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(&query).bind(entity_id).fetch_all(db).await?;
+    Ok(rows)
+}
+
 /// Mark articles that depend on a bibliography entry for re-indexing.
 pub async fn mark_articles_for_reindex_by_bibl(
     db: &PgPool,
     bibl_id: i64,
 ) -> Result<Vec<(String, i64)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "UPDATE articles a
-         SET sync_status = 'pending_index', status_changed_at = now()
-         FROM article_bibliography ab
-         WHERE a.dictionary = ab.dictionary AND a.id = ab.article_id
-           AND ab.bibl_id = $1 AND a.sync_status = 'idle'
-         RETURNING a.dictionary, a.id",
-    )
-    .bind(bibl_id)
-    .fetch_all(db)
-    .await?;
-
-    Ok(rows)
+    mark_articles_for_reindex(db, "article_bibliography", "bibl_id", bibl_id).await
 }
 
 /// Mark articles that depend on a place entry for re-indexing.
@@ -382,32 +400,7 @@ pub async fn mark_articles_for_reindex_by_place(
     db: &PgPool,
     place_id: i64,
 ) -> Result<Vec<(String, i64)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "UPDATE articles a
-         SET sync_status = 'pending_index', status_changed_at = now()
-         FROM article_place ap
-         WHERE a.dictionary = ap.dictionary AND a.id = ap.article_id
-           AND ap.place_id = $1 AND a.sync_status = 'idle'
-         RETURNING a.dictionary, a.id",
-    )
-    .bind(place_id)
-    .fetch_all(db)
-    .await?;
-
-    Ok(rows)
-}
-
-/// Transition an article to idle after successful indexing.
-pub async fn mark_article_indexed(db: &PgPool, dict: &str, article_id: i64) -> Result<()> {
-    sqlx::query(
-        "UPDATE articles SET sync_status = 'idle', status_changed_at = now()
-         WHERE dictionary = $1 AND id = $2 AND sync_status = 'pending_index'",
-    )
-    .bind(dict)
-    .bind(article_id)
-    .execute(db)
-    .await?;
-    Ok(())
+    mark_articles_for_reindex(db, "article_place", "place_id", place_id).await
 }
 
 /// Get all article metadata for a dictionary.
@@ -440,7 +433,7 @@ pub async fn get_all_article_metadata(
 
 /// Store inline refs and resolve codes against bibliography and place data.
 #[allow(clippy::too_many_lines)]
-async fn store_inline_refs(
+pub async fn store_inline_refs(
     tx: &mut Transaction<'_, Postgres>,
     dict_str: &str,
     article_id: i64,
@@ -485,11 +478,9 @@ async fn store_inline_refs(
         let place_names: Vec<String> = unresolved_codes
             .iter()
             .flat_map(|c| {
-                let mut names = vec![c.to_string()];
-                if let Some(stripped) = c.strip_suffix('M') {
-                    names.push(stripped.to_string());
-                }
-                names
+                let base = c.to_string();
+                let stripped = c.strip_suffix('M').map(str::to_string);
+                std::iter::once(base).chain(stripped)
             })
             .collect::<HashSet<_>>()
             .into_iter()
@@ -540,7 +531,7 @@ async fn store_inline_refs(
 
         b.push_bind(dict_str.to_owned())
             .push_bind(article_id)
-            .push_bind(r.quote_content.clone())
+            .push_bind(r.quote_content.to_string())
             .push_bind(i32::try_from(r.offset_start).unwrap_or(i32::MAX))
             .push_bind(i32::try_from(r.offset_end).unwrap_or(i32::MAX))
             .push_bind(r.code.clone())
@@ -557,9 +548,10 @@ async fn store_inline_refs(
             !code_to_bibl.contains_key(r.code.as_str())
                 && !code_to_place.contains_key(r.code.as_str())
         })
-        .map(|r| r.code.clone())
+        .map(|r| r.code.as_str())
         .collect::<HashSet<_>>()
         .into_iter()
+        .map(String::from)
         .collect();
 
     Ok((resolved_bibl_ids, still_unresolved))
@@ -692,8 +684,25 @@ pub async fn write_outbox_fetch_article(
     dict: &str,
     article_id: i64,
 ) -> Result<()> {
+    write_outbox_fetch_article_with_meta(tx, dict, article_id, None, "").await
+}
+
+/// Write outbox entry for fetching an article with metadata from the article
+/// list.
+pub async fn write_outbox_fetch_article_with_meta(
+    tx: &mut Transaction<'_, Postgres>,
+    dict: &str,
+    article_id: i64,
+    revision: Option<i64>,
+    updated_at: &str,
+) -> Result<()> {
     let key = format!("{dict}:{article_id}");
-    let payload = serde_json::json!({"dictionary": dict, "article_id": article_id});
+    let payload = serde_json::json!({
+        "dictionary": dict,
+        "article_id": article_id,
+        "revision": revision,
+        "updated_at": updated_at,
+    });
     write_outbox(tx, "fetch_article", &key, &payload).await
 }
 
@@ -704,8 +713,8 @@ pub async fn write_outbox_index_article(
     article_id: i64,
 ) -> Result<()> {
     let key = format!("{dict}:{article_id}");
-    let payload = serde_json::json!({"dictionary": dict, "article_id": article_id});
-    write_outbox(tx, "index_article", &key, &payload).await
+    let payload = serde_json::json!({"article_keys": [&key]});
+    write_outbox(tx, "batch_index", &key, &payload).await
 }
 
 /// Write outbox entry for fetching a bibliography entry.
@@ -764,4 +773,134 @@ pub async fn load_concepts(db: &PgPool, dictionary: &str) -> Result<ConceptMap> 
         Some((data,)) => crate::extraction::build_concept_map(&data),
         None => HashMap::new(),
     })
+}
+
+/// Claim articles for indexing.
+pub async fn claim_articles_for_indexing(
+    db: &PgPool,
+    article_keys: &[(String, i64)],
+) -> Result<Vec<(String, i64)>> {
+    let dict_strs: Vec<&str> = article_keys.iter().map(|(d, _)| d.as_str()).collect();
+    let ids: Vec<i64> = article_keys.iter().map(|(_, id)| *id).collect();
+
+    let claimed: Vec<(String, i64)> = sqlx::query_as(
+        "UPDATE articles
+         SET sync_status = 'pending_index', status_changed_at = now()
+         WHERE (dictionary, id) IN (SELECT * FROM UNNEST($1::text[], $2::bigint[]))
+           AND sync_status = 'pending_index'
+         RETURNING dictionary, id",
+    )
+    .bind(&dict_strs)
+    .bind(&ids)
+    .fetch_all(db)
+    .await?;
+
+    Ok(claimed)
+}
+
+/// Load place data for a batch of articles.
+pub async fn load_batch_place_data(
+    db: &PgPool,
+    articles: &[(String, i64)],
+) -> Result<(ArticlePlaceMap, HashMap<i64, (String, String, String)>)> {
+    let dicts: Vec<&str> = articles.iter().map(|(d, _)| d.as_str()).collect();
+    let ids: Vec<i64> = articles.iter().map(|(_, id)| *id).collect();
+
+    let place_rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT ap.dictionary, ap.article_id, ap.place_id, ap.context
+         FROM article_place ap
+         WHERE (ap.dictionary, ap.article_id) IN
+         (SELECT * FROM UNNEST($1::text[], $2::bigint[]))",
+    )
+    .bind(&dicts)
+    .bind(&ids)
+    .fetch_all(db)
+    .await?;
+
+    let mut article_place_map: ArticlePlaceMap = HashMap::new();
+    let mut needed_place_ids: HashSet<i64> = HashSet::new();
+
+    for (dict, article_id, place_id, context) in place_rows {
+        needed_place_ids.insert(place_id);
+        let entry = article_place_map
+            .entry(dict)
+            .or_default()
+            .entry(article_id)
+            .or_default();
+        match context.as_str() {
+            "dialect" => entry.0.push(place_id),
+            "attestation" => entry.1.push(place_id),
+            _ => {}
+        }
+    }
+
+    let place_map = if needed_place_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let place_id_vec: Vec<i64> = needed_place_ids.into_iter().collect();
+        let place_meta: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, place_name, place_name_full, place_type FROM places WHERE id = ANY($1)",
+        )
+        .bind(&place_id_vec)
+        .fetch_all(db)
+        .await?;
+
+        place_meta
+            .into_iter()
+            .map(|(id, name, full_name, ptype)| (id, (name, full_name, ptype)))
+            .collect()
+    };
+
+    Ok((article_place_map, place_map))
+}
+
+/// Load bibliography entries by ID.
+pub async fn load_bibliography_by_ids(
+    db: &PgPool,
+    ids: &[i64],
+) -> Result<HashMap<i64, (String, String, String, String)>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows: Vec<(i64, String, String, String, String)> =
+        sqlx::query_as("SELECT id, code, author, title, year FROM bibliography WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(db)
+            .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, code, author, title, year)| (id, (code, author, title, year)))
+        .collect())
+}
+
+/// Load article data for a dictionary in chunks.
+pub async fn load_articles_data(
+    db: &PgPool,
+    dict: &str,
+    article_ids: &[i64],
+) -> Result<Vec<(i64, Value)>> {
+    let rows: Vec<(i64, Value)> = sqlx::query_as(
+        "SELECT id, data FROM articles WHERE dictionary = $1 AND id = ANY($2::bigint[])",
+    )
+    .bind(dict)
+    .bind(article_ids)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Mark articles as indexed.
+pub async fn mark_articles_indexed(db: &PgPool, dict: &str, article_ids: &[i64]) -> Result<()> {
+    sqlx::query(
+        "UPDATE articles SET sync_status = 'idle', status_changed_at = now()
+         WHERE dictionary = $1 AND id = ANY($2::bigint[]) AND sync_status = 'pending_index'",
+    )
+    .bind(dict)
+    .bind(article_ids)
+    .execute(db)
+    .await?;
+    Ok(())
 }

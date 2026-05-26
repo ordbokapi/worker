@@ -35,8 +35,7 @@ use crate::indexing;
 use crate::jobs::SendMatrixMessageJob;
 use crate::jobs::{
     BackfillInlineRefsJob, BatchIndexJob, FetchArticleJob, FetchArticleListJob,
-    FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, IndexArticleJob,
-    ResolveInlineCodeJob,
+    FetchBibliographyJob, FetchDictionaryMetadataJob, FetchPlaceJob, ResolveInlineCodeJob,
 };
 use crate::state::{SyncStatus, UibDictionary};
 use crate::storage;
@@ -95,7 +94,7 @@ impl SyncService {
             existing_metadata_map.len()
         );
 
-        let mut to_fetch: Vec<i64> = Vec::new();
+        let mut to_fetch: Vec<(i64, Option<i64>, String)> = Vec::new();
         let mut new_id_set = HashSet::new();
         #[cfg(feature = "matrix_notifs")]
         let mut new_count = 0u32;
@@ -141,7 +140,7 @@ impl SyncService {
                 }
             }
 
-            to_fetch.push(meta.article_id);
+            to_fetch.push((meta.article_id, meta.revision, meta.updated_at));
         }
 
         let mut missing_count = 0u32;
@@ -151,22 +150,29 @@ impl SyncService {
                     "[{dict}] Article {} ({}) no longer in UiB list.",
                     existing_id, ex_meta.primary_lemma
                 );
-                to_fetch.push(*existing_id);
+                to_fetch.push((*existing_id, None, String::new()));
                 missing_count += 1;
             }
         }
 
         if missing_count > 0 {
             warn!(
-                "[{dict}] {} articles no longer in UiB list, will re-fetch to check-",
+                "[{dict}] {} articles no longer in UiB list, will re-fetch to check.",
                 missing_count
             );
         }
 
         let mut tx = self.db.begin().await?;
 
-        for article_id in &to_fetch {
-            storage::write_outbox_fetch_article(&mut tx, dict.as_str(), *article_id).await?;
+        for (article_id, revision, updated_at) in &to_fetch {
+            storage::write_outbox_fetch_article_with_meta(
+                &mut tx,
+                dict.as_str(),
+                *article_id,
+                *revision,
+                updated_at,
+            )
+            .await?;
         }
 
         tx.commit().await?;
@@ -213,20 +219,29 @@ impl SyncService {
             }
         }
 
-        info!("[{dict}] Fetching article {} from UiB…", job.article_id);
-        let article_data = self.http.fetch_article(dict, job.article_id).await?;
+        debug!("[{dict}] Fetching article {} from UiB…", job.article_id);
+        let article_data = match self.http.fetch_article(dict, job.article_id).await {
+            Ok(data) => data,
+            Err(e) if is_not_found(&e) => {
+                warn!("[{dict}] Article {} not found upstream.", job.article_id);
+                storage::reset_article_to_idle(&self.db, dict, job.article_id).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         let analysis = extraction::analyze_article(dict, &article_data);
 
-        let revision = article_data
-            .get("revision")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        let updated_at = article_data
-            .get("updated")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let revision = job.revision.unwrap_or(0);
+        let updated_at = if job.updated_at.is_empty() {
+            article_data
+                .get("updated")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            job.updated_at.clone()
+        };
 
         let result = storage::store_article(
             &self.db,
@@ -239,7 +254,7 @@ impl SyncService {
         )
         .await?;
 
-        info!(
+        debug!(
             "[{dict}] Article {} ({}) stored. Pending index: bibl:{}, places:{}, related:{}",
             job.article_id,
             analysis.primary_lemma,
@@ -248,34 +263,6 @@ impl SyncService {
             result.related_fetched,
         );
 
-        Ok(())
-    }
-
-    /// Handle indexing a single article.
-    pub async fn handle_index_article(&self, job: IndexArticleJob) -> Result<()> {
-        let dict = UibDictionary::parse(&job.dictionary)
-            .ok_or_else(|| anyhow!("Unknown dictionary: {}", job.dictionary))?;
-
-        let status: Option<(String,)> =
-            sqlx::query_as("SELECT sync_status FROM articles WHERE dictionary = $1 AND id = $2")
-                .bind(dict.as_str())
-                .bind(job.article_id)
-                .fetch_optional(&self.db)
-                .await?;
-
-        match status {
-            Some((s,)) if s == "pending_index" => {}
-            _ => {
-                debug!(
-                    "[{dict}] Article {} not pending index, skipping index.",
-                    job.article_id
-                );
-                return Ok(());
-            }
-        }
-
-        indexing::index_article(&self.meili, &self.db, dict, job.article_id).await?;
-        debug!("[{dict}] Article {} indexed.", job.article_id);
         Ok(())
     }
 
@@ -295,9 +282,9 @@ impl SyncService {
             return Ok(());
         }
 
-        info!("Batch indexing {} articles…", article_keys.len());
+        debug!("Batch indexing {} articles…", article_keys.len());
         indexing::batch_index_articles(&self.meili, &self.db, &article_keys).await?;
-        info!("Batch index complete.");
+        debug!("Batch index complete.");
         Ok(())
     }
 
@@ -370,7 +357,7 @@ impl SyncService {
         if !code.is_empty() {
             let resolved = storage::resolve_inline_ref_as_bibl(&self.db, job.bibl_id, code).await?;
             if resolved > 0 {
-                info!(
+                debug!(
                     "Resolved {resolved} inline refs for code '{code}' → bibl {}",
                     job.bibl_id
                 );
@@ -424,7 +411,7 @@ impl SyncService {
             let resolved =
                 storage::resolve_inline_place_by_name(&self.db, job.place_id, place_name).await?;
             if resolved > 0 {
-                info!(
+                debug!(
                     "Resolved {resolved} inline refs for place '{place_name}' → ID {}",
                     job.place_id
                 );
@@ -462,7 +449,7 @@ impl SyncService {
             return Ok(());
         }
 
-        info!("Resolving inline code '{}'…", job.code);
+        debug!("Resolving inline code '{}'…", job.code);
 
         if let Ok(bibl_entries) = self.http.fetch_bibliography_by_code(&job.code).await
             && let Some(entry) = bibl_entries.first()
@@ -483,7 +470,7 @@ impl SyncService {
             let resolved =
                 storage::resolve_inline_ref_as_bibl(&self.db, bibl_id, &job.code).await?;
             if resolved > 0 {
-                info!(
+                debug!(
                     "Resolved inline code '{}' as bibliography ID {bibl_id}",
                     job.code
                 );
@@ -504,7 +491,7 @@ impl SyncService {
                 let resolved =
                     storage::resolve_inline_place_by_name(&self.db, place_id, name).await?;
                 if resolved > 0 {
-                    info!(
+                    debug!(
                         "Resolved inline code '{}' as place '{name}', ID {place_id}",
                         job.code
                     );
@@ -513,7 +500,7 @@ impl SyncService {
             }
         }
 
-        info!("Could not resolve inline code '{}'.", job.code);
+        debug!("Could not resolve inline code '{}'.", job.code);
         Ok(())
     }
 
@@ -536,7 +523,7 @@ impl SyncService {
             }
 
             let (resolved_ids, unresolved_codes) =
-                store_inline_refs_in_tx(&mut tx, "no", *article_id, &refs).await?;
+                storage::store_inline_refs(&mut tx, "no", *article_id, &refs).await?;
 
             if !resolved_ids.is_empty() {
                 sqlx::query(
@@ -581,8 +568,62 @@ impl SyncService {
     /// Handle periodic sweep.
     pub async fn handle_sweep(&self) -> Result<()> {
         crate::outbox::run_sweep(&self.db).await?;
+        self.cleanup_orphans().await;
         self.vacuum_queues().await;
         Ok(())
+    }
+
+    /// Pick up orphaned jobs that are stuck to workers that died.
+    async fn cleanup_orphans(&self) {
+        let script = redis::Script::new(
+            r"
+            local workers_set = KEYS[1]
+            local active_list = KEYS[2]
+            local signal_list = KEYS[3]
+            local cutoff = ARGV[1]
+
+            local dead_workers = redis.call('zrangebyscore', workers_set, 0, cutoff)
+            local total = 0
+
+            for _, inflight_key in ipairs(dead_workers) do
+                local jobs = redis.call('smembers', inflight_key)
+                if #jobs > 0 then
+                    redis.call('rpush', active_list, unpack(jobs))
+                    redis.call('del', inflight_key)
+                    total = total + #jobs
+                end
+                redis.call('zrem', workers_set, inflight_key)
+            end
+
+            if total > 0 then
+                redis.call('del', signal_list)
+                redis.call('lpush', signal_list, 1)
+            end
+
+            return total
+            ",
+        );
+
+        let cutoff = chrono::Utc::now().timestamp() - 300;
+
+        for ns in crate::jobs::QUEUE_NAMESPACES {
+            let config = RedisConfig::default().set_namespace(ns);
+            let mut conn = self.redis_conn.clone();
+
+            let result: Result<i64, _> = script
+                .key(config.workers_set())
+                .key(config.active_jobs_list())
+                .key(config.signal_list())
+                .arg(cutoff)
+                .invoke_async(&mut conn)
+                .await;
+
+            match result {
+                Ok(0) => {}
+                Ok(n) => info!("Re-enqueued {n} orphaned jobs from {ns}"),
+                Err(e) => warn!("Failed to reenqueue orphaned jobs in {ns}: {e}"),
+            }
+        }
     }
 
     /// Clean up old jobs.
@@ -799,14 +840,14 @@ impl SyncService {
             batch.push(article_id);
 
             if batch.len() >= 1000 {
+                let batch_to_send = std::mem::take(&mut batch);
                 storage
                     .push(BackfillInlineRefsJob {
-                        article_ids: batch.clone(),
+                        article_ids: batch_to_send,
                     })
                     .await
                     .map_err(|e| anyhow!("Failed to enqueue backfill batch: {e}"))?;
-                count += batch.len();
-                batch.clear();
+                count += 1000;
             }
         }
 
@@ -901,9 +942,9 @@ impl SyncService {
         context_msg: impl FnOnce() -> String,
     ) -> Result<()> {
         if affected.is_empty() {
-            info!("{}.", context_msg());
+            debug!("{}.", context_msg());
         } else {
-            info!(
+            debug!(
                 "{}, {} articles marked for re-index.",
                 context_msg(),
                 affected.len()
@@ -921,133 +962,4 @@ fn is_not_found(err: &anyhow::Error) -> bool {
     err.downcast_ref::<reqwest::Error>()
         .and_then(reqwest::Error::status)
         == Some(reqwest::StatusCode::NOT_FOUND)
-}
-
-/// Store inline references for an article.
-#[allow(clippy::too_many_lines)]
-async fn store_inline_refs_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    dict_str: &str,
-    article_id: i64,
-    refs: &[extraction::InlineRef],
-) -> Result<(Vec<i64>, Vec<String>)> {
-    use std::collections::HashMap;
-
-    sqlx::query("DELETE FROM inline_ref_parse WHERE dictionary = $1 AND article_id = $2")
-        .bind(dict_str)
-        .bind(article_id)
-        .execute(&mut **tx)
-        .await?;
-
-    if refs.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let codes: Vec<&str> = refs
-        .iter()
-        .map(|r| r.code.as_str())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let resolved_bibl: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, code FROM bibliography WHERE code = ANY($1)")
-            .bind(&codes)
-            .fetch_all(&mut **tx)
-            .await?;
-
-    let mut code_to_bibl: HashMap<&str, i64> = HashMap::new();
-    for (id, code) in &resolved_bibl {
-        code_to_bibl.entry(code.as_str()).or_insert(*id);
-    }
-
-    let unresolved_codes: Vec<&str> = codes
-        .iter()
-        .filter(|c| !code_to_bibl.contains_key(*c))
-        .copied()
-        .collect();
-
-    let mut code_to_place: HashMap<&str, i64> = HashMap::new();
-    if !unresolved_codes.is_empty() {
-        let place_names: Vec<String> = unresolved_codes
-            .iter()
-            .flat_map(|c| {
-                let mut names = vec![c.to_string()];
-                if let Some(stripped) = c.strip_suffix('M') {
-                    names.push(stripped.to_string());
-                }
-                names
-            })
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let resolved_places: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, place_name FROM places WHERE place_name = ANY($1)")
-                .bind(&place_names)
-                .fetch_all(&mut **tx)
-                .await?;
-
-        let place_name_to_id: HashMap<&str, i64> = resolved_places
-            .iter()
-            .map(|(id, name)| (name.as_str(), *id))
-            .collect();
-
-        for code in &unresolved_codes {
-            if let Some(&pid) = place_name_to_id.get(*code) {
-                code_to_place.insert(code, pid);
-            } else if let Some(stripped) = code.strip_suffix('M')
-                && let Some(&pid) = place_name_to_id.get(stripped)
-            {
-                code_to_place.insert(code, pid);
-            }
-        }
-    }
-
-    let mut resolved_bibl_ids = Vec::new();
-
-    let mut qb = sqlx::QueryBuilder::new(
-        "INSERT INTO inline_ref_parse \
-         (dictionary, article_id, quote_content, offset_start, offset_end, code, spec, ref_type, bibl_id, place_id) ",
-    );
-    qb.push_values(refs, |mut b, r| {
-        let bibl_id = code_to_bibl.get(r.code.as_str()).copied();
-        let place_id = code_to_place.get(r.code.as_str()).copied();
-        let ref_type = if bibl_id.is_some() {
-            Some("bibl")
-        } else if place_id.is_some() {
-            Some("place")
-        } else {
-            None
-        };
-
-        if let Some(id) = bibl_id {
-            resolved_bibl_ids.push(id);
-        }
-
-        b.push_bind(dict_str.to_owned())
-            .push_bind(article_id)
-            .push_bind(r.quote_content.clone())
-            .push_bind(i32::try_from(r.offset_start).unwrap_or(i32::MAX))
-            .push_bind(i32::try_from(r.offset_end).unwrap_or(i32::MAX))
-            .push_bind(r.code.clone())
-            .push_bind(r.spec.clone())
-            .push_bind(ref_type)
-            .push_bind(bibl_id)
-            .push_bind(place_id);
-    });
-    qb.build().execute(&mut **tx).await?;
-
-    let still_unresolved: Vec<String> = refs
-        .iter()
-        .filter(|r| {
-            !code_to_bibl.contains_key(r.code.as_str())
-                && !code_to_place.contains_key(r.code.as_str())
-        })
-        .map(|r| r.code.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    Ok((resolved_bibl_ids, still_unresolved))
 }

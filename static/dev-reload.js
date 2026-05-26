@@ -16,22 +16,29 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
-{
-  let lastHash = null;
+const scrollKey = "dev-reload-scroll";
+const saved = sessionStorage.getItem(scrollKey);
 
-  async function checkReload() {
-    try {
-      const res = await fetch(location.pathname, { cache: "no-store" });
-      const text = await res.text();
-      const hash = text.length + ":" + text.slice(0, 200);
+if (saved) {
+  const { x, y } = JSON.parse(saved);
+  const maxX = document.documentElement.scrollWidth - window.innerWidth;
+  const maxY = document.documentElement.scrollHeight - window.innerHeight;
 
-      if (lastHash && hash !== lastHash) {
-        location.reload();
-      }
-
-      lastHash = hash;
-    } catch {}
-  }
-
-  setInterval(checkReload, 1000);
+  sessionStorage.removeItem(scrollKey);
+  window.scrollTo(Math.min(x, maxX), Math.min(y, maxY));
 }
+
+const proto = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${proto}//${location.host}/api/dev-reload/ws`);
+
+ws.addEventListener("message", () => {
+  sessionStorage.setItem(
+    scrollKey,
+    JSON.stringify({ x: window.scrollX, y: window.scrollY }),
+  );
+  location.reload();
+});
+
+ws.addEventListener("close", () => {
+  setTimeout(connect, 2000);
+});

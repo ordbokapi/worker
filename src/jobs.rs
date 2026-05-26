@@ -35,21 +35,14 @@ impl FetchArticleListJob {
 pub struct FetchArticleJob {
     pub dictionary: String,
     pub article_id: i64,
+    #[serde(default)]
+    pub revision: Option<i64>,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 impl FetchArticleJob {
     pub const NAMESPACE: &str = "apalis:article";
-}
-
-/// Index a single article in Meilisearch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexArticleJob {
-    pub dictionary: String,
-    pub article_id: i64,
-}
-
-impl IndexArticleJob {
-    pub const NAMESPACE: &str = "apalis:index-article";
 }
 
 /// Batch-index multiple articles in Meilisearch.
@@ -137,7 +130,6 @@ impl SweepJob {
 pub const QUEUE_NAMESPACES: &[&str] = &[
     FetchArticleListJob::NAMESPACE,
     FetchArticleJob::NAMESPACE,
-    IndexArticleJob::NAMESPACE,
     BatchIndexJob::NAMESPACE,
     FetchDictionaryMetadataJob::NAMESPACE,
     FetchBibliographyJob::NAMESPACE,

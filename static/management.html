@@ -34,10 +34,12 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         --primary-hover: #047a90;
         --border: #d0dfe4;
         --border-subtle: #e4ecef;
+        --color-on-dark-separator: rgba(255, 255, 255, 0.3);
         --color-error: #d64545;
         --color-success: #28a745;
         --color-warning: #d29922;
         --color-warning-bg: #fff3cd;
+        --color-shadow: rgba(0, 0, 0, 0.1);
         --radius: 6px;
         --font-mono: "IBM Plex Mono", "Menlo", "Consolas", monospace;
       }
@@ -55,6 +57,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           --color-error: #f87171;
           --color-success: #3fb950;
           --color-warning-bg: #3d2e00;
+          --color-shadow: rgba(0, 0, 0, 0.5);
         }
       }
 
@@ -111,6 +114,23 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         font-size: 1rem;
         font-weight: 600;
         color: var(--text-muted);
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      h2 > span {
+        flex-grow: 1;
+      }
+
+      h2 label {
+        font-weight: normal;
+        font-size: 0.85rem;
+        color: var(--text);
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        cursor: pointer;
       }
 
       button {
@@ -129,6 +149,21 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       button:hover {
         border-color: var(--primary);
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+      }
+
+      input[type="checkbox"]:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+      }
+
+      summary:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
       }
 
       button:disabled {
@@ -156,6 +191,11 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       button.danger:hover {
         background: var(--color-error);
         color: #fff;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
       }
 
       table {
@@ -196,6 +236,40 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       td.num {
         font-family: var(--font-mono);
+        position: relative;
+        padding-right: 1.4em;
+      }
+
+      .trend {
+        position: absolute;
+        right: 0.2em;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 0.7em;
+        font-family: system-ui, sans-serif;
+        opacity: 1;
+        transition: opacity 0.6s ease;
+        pointer-events: none;
+      }
+
+      .trend.hidden {
+        opacity: 0;
+      }
+
+      .trend.good {
+        color: var(--color-success);
+      }
+
+      .trend.bad {
+        color: var(--color-error);
+      }
+
+      .trend.neutral {
+        color: var(--text-muted);
+      }
+
+      .trend.steady {
+        color: var(--color-warning);
       }
 
       .zero {
@@ -224,18 +298,6 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         gap: 0.4rem;
         flex-wrap: wrap;
         align-items: center;
-      }
-
-      .sync-controls {
-        display: flex;
-        gap: 0.8rem;
-        align-items: center;
-        flex-wrap: wrap;
-        font-size: 0.88rem;
-      }
-
-      .sync-controls label {
-        cursor: pointer;
       }
 
       section {
@@ -323,6 +385,92 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         border-color: var(--color-error);
         color: var(--color-error);
       }
+
+      .split-btn {
+        position: relative;
+        display: inline-flex;
+        border-radius: var(--radius);
+      }
+
+      .split-btn > button {
+        border-radius: 0;
+      }
+
+      .split-btn > button:first-child {
+        border-radius: var(--radius) 0 0 var(--radius);
+        border-right: 1px solid var(--color-on-dark-separator);
+      }
+
+      .split-btn > button:last-of-type {
+        border-radius: 0 var(--radius) var(--radius) 0;
+        padding: 0.35rem 0.35rem;
+        border-left: none;
+        font-size: 0.7rem;
+        line-height: 1;
+      }
+
+      .split-btn .dropdown {
+        position: absolute;
+        top: calc(100% + 4px);
+        right: 0;
+        white-space: nowrap;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: 0 6px 16px var(--color-shadow);
+        z-index: 10;
+      }
+
+      .split-btn .dropdown[hidden] {
+        display: none;
+      }
+
+      .split-btn .dropdown button {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 0.4rem;
+        width: 100%;
+        border: none;
+        border-radius: 0;
+        background: transparent;
+        padding: 0.4rem 0.6rem;
+        font-size: 0.82rem;
+        color: var(--text);
+      }
+
+      .split-btn .dropdown button:first-child {
+        border-radius: var(--radius) var(--radius) 0 0;
+      }
+
+      .split-btn .dropdown button:last-child {
+        border-radius: 0 0 var(--radius) var(--radius);
+      }
+
+      .split-btn .dropdown button:hover {
+        background: var(--bg-surface);
+      }
+
+      .split-btn .dropdown button .check {
+        display: inline-block;
+        min-width: 1.1em;
+        width: 1.1em;
+        text-align: center;
+        flex-shrink: 0;
+        color: var(--primary);
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
     </style>
   </head>
   <body>
@@ -339,7 +487,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       </div>
     </header>
 
-    <div id="no-auth-warning" class="warning hidden">
+    <div id="no-auth-warning" class="warning hidden" role="alert">
       ⚠️ MGMT_UI_SECRET_HASH er ikkje sett. Alle har tilgang.
     </div>
 
@@ -353,20 +501,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
     </details>
 
     <section>
-      <h2>Artiklar</h2>
-      <table id="article-table">
-        <thead>
-          <tr>
-            <th>Ordbok</th>
-            <th class="num">Totalt</th>
-            <th class="num">Ledige</th>
-            <th class="num">Ventar på henting</th>
-            <th class="num">Ventar på indeksering</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div class="sync-controls" style="margin-top: 0.8rem">
+      <h2>
+        <span>Artiklar</span>
         <label
           ><input type="checkbox" name="dict" value="bm" checked /> bm</label
         >
@@ -376,44 +512,92 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         <label
           ><input type="checkbox" name="dict" value="no" checked /> no</label
         >
-        <button id="btn-sync" class="primary">Synkroniser</button>
-        <label class="muted"
-          ><input type="checkbox" id="force-sync" /> Full
-          resynkronisering</label
-        >
+        <div class="split-btn">
+          <button id="btn-sync" class="primary">Synkroniser</button>
+          <button
+            id="btn-sync-mode"
+            class="primary"
+            aria-label="Vel synkroniseringsmodus"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            ▾
+          </button>
+          <div class="dropdown" id="sync-mode-dropdown" role="menu" hidden>
+            <button
+              data-mode="incremental"
+              role="menuitemradio"
+              aria-checked="false"
+            >
+              <span class="check" aria-hidden="true"></span> Inkrementell
+            </button>
+            <button data-mode="full" role="menuitemradio" aria-checked="false">
+              <span class="check" aria-hidden="true"></span> Full
+              resynkronisering
+            </button>
+          </div>
+        </div>
+      </h2>
+      <div class="table-wrap">
+        <table id="article-table">
+          <caption class="sr-only">
+            Artikkelstatus per ordbok
+          </caption>
+          <thead>
+            <tr>
+              <th>Ordbok</th>
+              <th class="num">Totalt</th>
+              <th class="num">Ledige</th>
+              <th class="num">Ventar på henting</th>
+              <th class="num">Ventar på indeksering</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
     <section>
-      <h2>Frå utboks til køar</h2>
-      <table id="outbox-table">
-        <thead>
-          <tr>
-            <th>Oppgåvetype</th>
-            <th class="num">På vent</th>
-            <th class="num">Sendt (1t)</th>
-            <th class="num">Sendt (24t)</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <h2>Frå utbosks til køar</h2>
+      <div class="table-wrap">
+        <table id="outbox-table">
+          <caption class="sr-only">
+            Utboksstatus per oppgåvetype
+          </caption>
+          <thead>
+            <tr>
+              <th>Oppgåvetype</th>
+              <th class="num">På vent</th>
+              <th class="num">Sendt (1t)</th>
+              <th class="num">Sendt (24t)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
 
     <section>
-      <h2>Køar (Redis)</h2>
-      <table id="queue-table">
-        <thead>
-          <tr>
-            <th>Kø</th>
-            <th class="num">På vent</th>
-            <th class="num">Planlagde</th>
-            <th class="num">Mislukka</th>
-            <th class="num">Daude</th>
-            <th class="num">Ferdige</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <h2><span>Køar</span> <button id="btn-sweep">Rydd opp</button></h2>
+      <div class="table-wrap">
+        <table id="queue-table">
+          <caption class="sr-only">
+            Køstatus
+          </caption>
+          <thead>
+            <tr>
+              <th>Kø</th>
+              <th class="num">På vent</th>
+              <th class="num">I gang</th>
+              <th class="num">Planlagde</th>
+              <th class="num">Mislukka</th>
+              <th class="num">Daude</th>
+              <th class="num">Ferdige</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
 
     <section>
@@ -421,7 +605,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       <ul class="active-jobs" id="active-jobs"></ul>
     </section>
 
-    <div class="toast" id="toast"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script type="module">
       const noAuthWarning = document.querySelector("#no-auth-warning");
@@ -434,31 +618,94 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       const toastElement = document.querySelector("#toast");
 
       let paused = false;
-      let timer = null;
-      const refreshInterval = 2000;
+      let ws = null;
+      const trendFadeAfter = 4;
 
-      {
-        const res = await fetch("/api/auth-status");
-        const { auth_required } = await res.json();
+      const trendMap = new WeakMap();
+      let trendsEnabled = false;
 
-        if (!auth_required) {
-          noAuthWarning.classList.remove("hidden");
+      function getTrend(td) {
+        if (!trendMap.has(td)) {
+          trendMap.set(td, { prev: null, direction: null, stableCount: 0 });
         }
+
+        return trendMap.get(td);
       }
 
       function num(n) {
         return n.toLocaleString("nn");
       }
 
-      function setCell(td, value, isNum = false) {
+      function setCell(td, value, isNum = false, polarity = "down-good") {
         const text = isNum ? num(value) : String(value);
+        const span = td.firstChild;
 
-        if (td.textContent !== text) {
-          td.textContent = text;
+        if (
+          !span ||
+          span.nodeType !== Node.ELEMENT_NODE ||
+          !span.classList.contains("val")
+        ) {
+          td.innerHTML = "";
+
+          const valSpan = document.createElement("span");
+
+          valSpan.className = "val";
+          valSpan.textContent = text;
+
+          td.appendChild(valSpan);
+
+          if (isNum) {
+            const indicator = document.createElement("span");
+
+            indicator.className = "trend hidden";
+
+            td.appendChild(indicator);
+          }
+        } else {
+          if (span.textContent !== text) {
+            span.textContent = text;
+          }
         }
 
         if (isNum) {
           td.classList.toggle("zero", value === 0);
+
+          const trend = getTrend(td);
+          const indicator = td.querySelector(".trend");
+
+          if (trendsEnabled && trend.prev !== null && indicator) {
+            if (value > trend.prev) {
+              trend.direction = "up";
+              trend.stableCount = 0;
+            } else if (value < trend.prev) {
+              trend.direction = "down";
+              trend.stableCount = 0;
+            } else {
+              trend.stableCount++;
+            }
+
+            if (trend.stableCount === 0) {
+              const sentiment =
+                polarity === "neutral"
+                  ? "neutral"
+                  : (trend.direction === "down" && polarity === "down-good") ||
+                      (trend.direction === "up" && polarity === "up-good")
+                    ? "good"
+                    : "bad";
+              indicator.className = `trend ${sentiment}`;
+              indicator.textContent = trend.direction === "up" ? "▲" : "▼";
+            } else if (trend.stableCount === 1 && trend.direction) {
+              indicator.className = "trend steady";
+              indicator.textContent = "●";
+            } else if (trend.stableCount >= trendFadeAfter) {
+              indicator.className = "trend hidden";
+              trend.direction = null;
+            }
+          }
+
+          if (trendsEnabled) {
+            trend.prev = value;
+          }
         }
       }
 
@@ -490,7 +737,6 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       const jobTypeOrder = [
         "fetch_article",
-        "index_article",
         "batch_index",
         "fetch_bibliography",
         "fetch_place",
@@ -499,42 +745,119 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       const jobTypeLabels = {
         fetch_article: "Hent artikkel",
-        index_article: "Indekser artikkel",
-        batch_index: "Batchindeksering",
+        batch_index: "Indekser artiklar",
         fetch_bibliography: "Hent bibliografi",
         fetch_place: "Hent stad",
         resolve_inline_code: "Løys innebygd kode",
       };
 
-      async function fetchStats() {
-        try {
-          const res = await fetch("/api/stats");
+      const dictionaries = window.__CONFIG__?.dictionaries || [];
+      const queueNamespaces = window.__CONFIG__?.queueNamespaces || [];
 
-          if (res.status === 401) {
-            location.href = "/login";
-            return;
-          }
+      render({
+        articles: dictionaries.map((dictionary) => ({
+          dictionary,
+          idle: 0,
+          pending_fetch: 0,
+          pending_index: 0,
+        })),
+        outbox: {
+          by_type: [],
+          pending: 0,
+          processed_last_hour: 0,
+          processed_last_day: 0,
+        },
+        queues: queueNamespaces.map((namespace) => ({
+          namespace,
+          pending: 0,
+          running: 0,
+          scheduled: 0,
+          failed: 0,
+          dead: 0,
+          done: 0,
+        })),
+        active_jobs: [],
+      });
 
-          if (!res.ok) {
-            throw new Error(`HTTP ${res.status}`);
-          }
+      {
+        const res = await fetch("/api/auth-status");
+        const { auth_required } = await res.json();
 
-          const data = await res.json();
-
-          render(data);
-
-          statusElement.textContent = "Tilkopla";
-          statusElement.style.color = "var(--color-success)";
-
-          lastUpdateElement.textContent = new Date().toLocaleTimeString();
-        } catch (e) {
-          statusElement.textContent = "Fråkopla";
-          statusElement.style.color = "var(--color-error)";
-          lastUpdateElement.textContent = e.message;
+        if (!auth_required) {
+          noAuthWarning.classList.remove("hidden");
         }
       }
 
+      function connectWs() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${proto}//${location.host}/api/stats/ws`);
+
+        ws.addEventListener("open", () => {
+          statusElement.textContent = "Tilkopla";
+          statusElement.style.color = "var(--color-success)";
+        });
+
+        ws.addEventListener("message", (event) => {
+          if (paused) {
+            return;
+          }
+
+          const msg = JSON.parse(event.data);
+
+          switch (msg.type) {
+            case "queues":
+              renderQueues(msg.data);
+              break;
+            case "active_jobs":
+              renderActiveJobs(msg.data);
+              break;
+            case "outbox":
+              renderOutbox(msg.data);
+              break;
+            case "articles":
+              renderArticles(msg.data);
+              break;
+          }
+
+          if (!trendsEnabled) {
+            trendsEnabled = true;
+          }
+
+          lastUpdateElement.textContent = new Date().toLocaleTimeString();
+        });
+
+        ws.addEventListener("close", () => {
+          statusElement.textContent = "Fråkopla";
+          statusElement.style.color = "var(--color-error)";
+          if (!paused) {
+            setTimeout(connectWs, 3000);
+          }
+        });
+
+        ws.addEventListener("error", () => {
+          ws.close();
+        });
+      }
+
       function render({ queues, outbox, articles, active_jobs }) {
+        if (articles) {
+          renderArticles(articles);
+        }
+
+        if (outbox) {
+          renderOutbox(outbox);
+        }
+
+        if (queues) {
+          renderQueues(queues);
+        }
+
+        if (active_jobs) {
+          renderActiveJobs(active_jobs);
+        }
+      }
+
+      function renderArticles(articles) {
         ensureRows(articleBody, articles.length, 5);
         articles.forEach((a, i) => {
           const row = articleBody.rows[i];
@@ -544,12 +867,15 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             row.cells[1],
             a.idle + a.pending_fetch + a.pending_index,
             true,
+            "neutral",
           );
-          setCell(row.cells[2], a.idle, true);
+          setCell(row.cells[2], a.idle, true, "up-good");
           setCell(row.cells[3], a.pending_fetch, true);
           setCell(row.cells[4], a.pending_index, true);
         });
+      }
 
+      function renderOutbox(outbox) {
         const outboxMap = Object.fromEntries(
           outbox.by_type.map((o) => [o.job_type, o]),
         );
@@ -565,8 +891,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
           setCell(row.cells[0], jobTypeLabels[type] || type);
           setCell(row.cells[1], o.pending, true);
-          setCell(row.cells[2], o.processed_last_hour, true);
-          setCell(row.cells[3], o.processed_last_day, true);
+          setCell(row.cells[2], o.processed_last_hour, true, "neutral");
+          setCell(row.cells[3], o.processed_last_day, true, "neutral");
         });
         const totalRow = outboxBody.rows[jobTypeOrder.length];
 
@@ -574,21 +900,26 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
         setCell(totalRow.cells[0], "Totalt");
         setCell(totalRow.cells[1], outbox.pending, true);
-        setCell(totalRow.cells[2], outbox.processed_last_hour, true);
-        setCell(totalRow.cells[3], outbox.processed_last_day, true);
+        setCell(totalRow.cells[2], outbox.processed_last_hour, true, "neutral");
+        setCell(totalRow.cells[3], outbox.processed_last_day, true, "neutral");
+      }
 
-        ensureRows(queueBody, queues.length, 6);
+      function renderQueues(queues) {
+        ensureRows(queueBody, queues.length, 7);
         queues.forEach((q, i) => {
           const row = queueBody.rows[i];
 
-          setCell(row.cells[0], q.namespace.replace("apalis:", ""));
+          setCell(row.cells[0], q.namespace);
           setCell(row.cells[1], q.pending, true);
-          setCell(row.cells[2], q.scheduled, true);
-          setCell(row.cells[3], q.failed, true);
-          setCell(row.cells[4], q.dead, true);
-          setCell(row.cells[5], q.done, true);
+          setCell(row.cells[2], q.running, true, "neutral");
+          setCell(row.cells[3], q.scheduled, true, "neutral");
+          setCell(row.cells[4], q.failed, true);
+          setCell(row.cells[5], q.dead, true);
+          setCell(row.cells[6], q.done, true, "neutral");
         });
+      }
 
+      function renderActiveJobs(active_jobs) {
         if (active_jobs.length === 0) {
           if (
             activeElement.children.length !== 1 ||
@@ -644,13 +975,28 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           const data = await res.json();
 
           showToast(data.message, !data.ok);
-          fetchStats();
         } catch (e) {
           showToast(`Feil: ${e.message}`, true);
         } finally {
           btn.disabled = false;
         }
       }
+
+      document
+        .querySelector("#btn-sweep")
+        .addEventListener("click", async (e) => {
+          const btn = e.currentTarget;
+          btn.disabled = true;
+          try {
+            const res = await fetch("/api/sweep", { method: "POST" });
+            const data = await res.json();
+            showToast(data.message, !data.ok);
+          } catch (err) {
+            showToast(`Feil: ${err.message}`, true);
+          } finally {
+            btn.disabled = false;
+          }
+        });
 
       document
         .querySelector("#btn-clear-queues")
@@ -668,62 +1014,153 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           doAction("/api/clear-all", e.currentTarget),
         );
 
-      document
-        .querySelector("#btn-sync")
-        .addEventListener("click", async (e) => {
-          const btn = e.currentTarget;
-          const checked = [
-            ...document.querySelectorAll('input[name="dict"]:checked'),
-          ].map((el) => el.value);
+      let syncMode = localStorage.getItem("syncMode") || "incremental";
+      const syncBtn = document.querySelector("#btn-sync");
+      const syncModeBtn = document.querySelector("#btn-sync-mode");
+      const syncDropdown = document.querySelector("#sync-mode-dropdown");
 
-          if (checked.length === 0) {
-            showToast("Vel minst éi ordbok.", true);
-            return;
-          }
-
-          const force = document.querySelector("#force-sync").checked;
-
-          if (
-            !confirm(
-              `Synkronisere ${checked.join(", ")}${force ? " (full)" : ""}?`,
-            )
-          ) {
-            return;
-          }
-
-          btn.disabled = true;
-
-          try {
-            const res = await fetch("/api/sync", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ dictionaries: checked, force }),
-            });
-            const data = await res.json();
-
-            showToast(data.message, !data.ok);
-            fetchStats();
-          } catch (err) {
-            showToast(`Feil: ${err.message}`, true);
-          } finally {
-            btn.disabled = false;
-          }
+      function updateSyncBtnLabel() {
+        syncBtn.textContent =
+          syncMode === "full" ? "Full synk." : "Synkroniser";
+        syncDropdown.querySelectorAll("button").forEach((btn) => {
+          const check = btn.querySelector(".check");
+          const selected = btn.dataset.mode === syncMode;
+          check.textContent = selected ? "✓" : "";
+          btn.setAttribute("aria-checked", String(selected));
         });
+      }
+
+      updateSyncBtnLabel();
+
+      function openDropdown() {
+        syncDropdown.hidden = false;
+        syncModeBtn.setAttribute("aria-expanded", "true");
+
+        const first =
+          syncDropdown.querySelector("[aria-checked='true']") ||
+          syncDropdown.querySelector("button");
+
+        first?.focus();
+      }
+
+      function closeDropdown(restoreFocus = true) {
+        syncDropdown.hidden = true;
+        syncModeBtn.setAttribute("aria-expanded", "false");
+
+        if (restoreFocus) {
+          syncModeBtn.focus();
+        }
+      }
+
+      syncModeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (syncDropdown.hidden) {
+          openDropdown();
+        } else {
+          closeDropdown();
+        }
+      });
+
+      syncModeBtn.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+
+          if (syncDropdown.hidden) {
+            openDropdown();
+          }
+        }
+      });
+
+      syncDropdown.addEventListener("keydown", (e) => {
+        const items = [...syncDropdown.querySelectorAll("button")];
+        const idx = items.indexOf(document.activeElement);
+
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          items[(idx + 1) % items.length]?.focus();
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          items[(idx - 1 + items.length) % items.length]?.focus();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          closeDropdown();
+        } else if (e.key === "Tab") {
+          closeDropdown(false);
+        }
+      });
+
+      syncDropdown.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-mode]");
+
+        if (!btn) {
+          return;
+        }
+
+        syncMode = btn.dataset.mode;
+
+        localStorage.setItem("syncMode", syncMode);
+        updateSyncBtnLabel();
+
+        closeDropdown();
+      });
+
+      document.addEventListener("click", () => {
+        if (!syncDropdown.hidden) {
+          closeDropdown(false);
+        }
+      });
+
+      syncBtn.addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        const checked = [
+          ...document.querySelectorAll('input[name="dict"]:checked'),
+        ].map((el) => el.value);
+
+        if (checked.length === 0) {
+          showToast("Vel minst éi ordbok.", true);
+          return;
+        }
+
+        const force = syncMode === "full";
+
+        if (
+          !confirm(
+            `Synkronisere ${checked.join(", ")}${force ? " (full)" : ""}?`,
+          )
+        ) {
+          return;
+        }
+
+        btn.disabled = true;
+
+        try {
+          const res = await fetch("/api/sync", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dictionaries: checked, force }),
+          });
+          const data = await res.json();
+
+          showToast(data.message, !data.ok);
+        } catch (err) {
+          showToast(`Feil: ${err.message}`, true);
+        } finally {
+          btn.disabled = false;
+        }
+      });
 
       document.querySelector("#btn-pause").addEventListener("click", (e) => {
         paused = !paused;
         e.currentTarget.textContent = paused ? "▶ Hald fram" : "⏸ Pause";
 
         if (paused) {
-          clearInterval(timer);
+          ws?.close();
         } else {
-          fetchStats();
-          timer = setInterval(fetchStats, refreshInterval);
+          connectWs();
         }
       });
 
-      fetchStats();
-      timer = setInterval(fetchStats, refreshInterval);
+      connectWs();
     </script>
   </body>
 </html>

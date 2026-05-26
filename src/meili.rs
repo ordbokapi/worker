@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::extraction::{ArticleBibliography, ArticlePlaceData};
 use anyhow::Result;
 use futures::StreamExt;
 use meilisearch_sdk::settings::Settings;
@@ -143,86 +144,6 @@ pub struct PlaceSearchDocument {
     pub municipality_nr: Option<String>,
 }
 
-/// Place metadata to embed in an article search document.
-#[derive(Default)]
-pub struct ArticlePlaceData {
-    pub dialect_names: Vec<String>,
-    pub dialect_codes: Vec<String>,
-    pub dialect_types: Vec<String>,
-    pub attestation_names: Vec<String>,
-    pub attestation_codes: Vec<String>,
-    pub attestation_types: Vec<String>,
-    pub names: Vec<String>,
-    pub codes: Vec<String>,
-    pub types: Vec<String>,
-}
-
-/// Collect unique names, codes, and types from a slice of place IDs.
-fn collect_place_fields<S: std::hash::BuildHasher>(
-    ids: &[i64],
-    place_map: &std::collections::HashMap<i64, (String, String, String), S>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut names = Vec::new();
-    let mut codes = Vec::new();
-    let mut types = Vec::new();
-
-    for &id in ids {
-        if let Some((code, full_name, place_type)) = place_map.get(&id) {
-            let display_name = if full_name.is_empty() {
-                code
-            } else {
-                full_name
-            };
-            if !display_name.is_empty() && !names.contains(display_name) {
-                names.push(display_name.clone());
-            }
-            if !code.is_empty() && !codes.contains(code) {
-                codes.push(code.clone());
-            }
-            if !place_type.is_empty() && !types.contains(place_type) {
-                types.push(place_type.clone());
-            }
-        }
-    }
-
-    (names, codes, types)
-}
-
-/// Build split place metadata.
-#[must_use]
-pub fn build_article_place_data_split<S: std::hash::BuildHasher>(
-    dialect_ids: &[i64],
-    attestation_ids: &[i64],
-    place_map: &std::collections::HashMap<i64, (String, String, String), S>,
-) -> ArticlePlaceData {
-    let (dialect_names, dialect_codes, dialect_types) =
-        collect_place_fields(dialect_ids, place_map);
-    let (attestation_names, attestation_codes, attestation_types) =
-        collect_place_fields(attestation_ids, place_map);
-
-    // Combined: union of both
-    let all_ids: Vec<i64> = dialect_ids
-        .iter()
-        .chain(attestation_ids.iter())
-        .copied()
-        .collect::<std::collections::HashSet<i64>>()
-        .into_iter()
-        .collect();
-    let (names, codes, types) = collect_place_fields(&all_ids, place_map);
-
-    ArticlePlaceData {
-        dialect_names,
-        dialect_codes,
-        dialect_types,
-        attestation_names,
-        attestation_codes,
-        attestation_types,
-        names,
-        codes,
-        types,
-    }
-}
-
 /// Build a `BibliographySearchDocument` from a Clarino API response entry.
 #[must_use]
 pub fn build_bibliography_document(
@@ -254,559 +175,10 @@ pub fn build_bibliography_document(
     }
 }
 
-/// Extract bibliography IDs from article JSON and build bibliography metadata
-/// from a lookup map.
-#[must_use]
-pub fn build_article_bibliography<S: std::hash::BuildHasher>(
-    data: &serde_json::Value,
-    bib_map: &std::collections::HashMap<i64, (String, String, String, String), S>,
-) -> ArticleBibliography {
-    let mut all_bibl_ids: Vec<i64> = Vec::new();
-    let mut older_source_ids: Vec<i64> = Vec::new();
-    let mut written_form_source_ids: Vec<i64> = Vec::new();
-    let mut attestation_source_ids: Vec<i64> = Vec::new();
-
-    // Older sources
-    for id in data
-        .get("body")
-        .and_then(|b| b.get("older_source"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|source| source.get("bibl_id").and_then(serde_json::Value::as_i64))
-    {
-        if !older_source_ids.contains(&id) {
-            older_source_ids.push(id);
-        }
-        if !all_bibl_ids.contains(&id) {
-            all_bibl_ids.push(id);
-        }
-    }
-
-    // Written form sources.
-    for id in data
-        .get("body")
-        .and_then(|b| b.get("written_form"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .flat_map(|wf| {
-            wf.get("forms")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-        })
-        .flat_map(|form| {
-            form.get("sources")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|source| source.get("bibl_id").and_then(serde_json::Value::as_i64))
-    {
-        if !written_form_source_ids.contains(&id) {
-            written_form_source_ids.push(id);
-        }
-        if !all_bibl_ids.contains(&id) {
-            all_bibl_ids.push(id);
-        }
-    }
-
-    // Attestation sources.
-    collect_attestation_bibl_ids(data, &mut attestation_source_ids, &mut all_bibl_ids);
-
-    // Also collect any remaining bibl_ids we haven't categorized
-    collect_bibl_ids(data, &mut all_bibl_ids);
-
-    let older_source = build_category(&older_source_ids, bib_map);
-    let written_form_source = build_category(&written_form_source_ids, bib_map);
-    let attestation_source = build_category(&attestation_source_ids, bib_map);
-    let all = build_category(&all_bibl_ids, bib_map);
-
-    ArticleBibliography {
-        older_source,
-        written_form_source,
-        attestation_source,
-        all,
-    }
-}
-
-fn build_category<S: std::hash::BuildHasher>(
-    ids: &[i64],
-    bib_map: &std::collections::HashMap<i64, (String, String, String, String), S>,
-) -> BibliographyCategory {
-    let mut codes = Vec::new();
-    let mut authors = Vec::new();
-    let mut titles = Vec::new();
-    let mut years = Vec::new();
-
-    for &id in ids {
-        if let Some((code, author, title, year)) = bib_map.get(&id) {
-            if !code.is_empty() && !codes.contains(code) {
-                codes.push(code.clone());
-            }
-            if !author.is_empty() && !authors.contains(author) {
-                authors.push(author.clone());
-            }
-            if !title.is_empty() && !titles.contains(title) {
-                titles.push(title.clone());
-            }
-            if !year.is_empty() && !years.contains(year) {
-                years.push(year.clone());
-            }
-        }
-    }
-
-    BibliographyCategory {
-        codes,
-        authors,
-        titles,
-        years,
-    }
-}
-
-fn collect_attestation_bibl_ids(
-    value: &serde_json::Value,
-    attestation_ids: &mut Vec<i64>,
-    all_ids: &mut Vec<i64>,
-) {
-    if let Some(defs) = value
-        .get("body")
-        .and_then(|b| b.get("definitions"))
-        .and_then(|v| v.as_array())
-    {
-        collect_attestation_from_defs(defs, attestation_ids, all_ids);
-    }
-}
-
-fn collect_attestation_from_defs(
-    defs: &[serde_json::Value],
-    attestation_ids: &mut Vec<i64>,
-    all_ids: &mut Vec<i64>,
-) {
-    for def in defs {
-        let elements = def.get("elements").and_then(|v| v.as_array());
-        for pr in elements.into_iter().flatten().flat_map(|el| {
-            el.get("place_refs")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-        }) {
-            let vis = pr
-                .get("vis")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            if vis == 1
-                && let Some(id) = pr.get("bibl_id").and_then(serde_json::Value::as_i64)
-            {
-                if !attestation_ids.contains(&id) {
-                    attestation_ids.push(id);
-                }
-                if !all_ids.contains(&id) {
-                    all_ids.push(id);
-                }
-            }
-        }
-        if let Some(sub_defs) = def.get("sub_definitions").and_then(|v| v.as_array()) {
-            collect_attestation_from_defs(sub_defs, attestation_ids, all_ids);
-        }
-    }
-}
-
-fn collect_bibl_ids(value: &serde_json::Value, ids: &mut Vec<i64>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(bibl_id) = map.get("bibl_id").and_then(serde_json::Value::as_i64)
-                && !ids.contains(&bibl_id)
-            {
-                ids.push(bibl_id);
-            }
-            for v in map.values() {
-                collect_bibl_ids(v, ids);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                collect_bibl_ids(v, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Index name for a given dictionary.
 #[must_use]
 pub fn index_name(dict: &str) -> String {
     format!("articles-{dict}")
-}
-
-/// Bibliography metadata to embed in an article search document.
-pub struct ArticleBibliography {
-    /// Per-category data for older sources.
-    pub older_source: BibliographyCategory,
-    /// Per-category data for written form sources.
-    pub written_form_source: BibliographyCategory,
-    /// Per-category data for attestation sources.
-    pub attestation_source: BibliographyCategory,
-    /// All sources combined.
-    pub all: BibliographyCategory,
-}
-
-impl ArticleBibliography {
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            older_source: BibliographyCategory::empty(),
-            written_form_source: BibliographyCategory::empty(),
-            attestation_source: BibliographyCategory::empty(),
-            all: BibliographyCategory::empty(),
-        }
-    }
-}
-
-/// Bibliography metadata for a single category.
-pub struct BibliographyCategory {
-    pub codes: Vec<String>,
-    pub authors: Vec<String>,
-    pub titles: Vec<String>,
-    pub years: Vec<String>,
-}
-
-impl BibliographyCategory {
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            codes: vec![],
-            authors: vec![],
-            titles: vec![],
-            years: vec![],
-        }
-    }
-}
-
-/// Recursively extract definition content, examples, and lemmas for sub
-/// articles.
-fn extract_definition_content(
-    defs: &[serde_json::Value],
-    def_parts: &mut Vec<String>,
-    ex_parts: &mut Vec<String>,
-    sub_lemmas: &mut Vec<String>,
-) {
-    for def in defs {
-        for element in def
-            .get("elements")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            let type_ = element.get("type_").and_then(|v| v.as_str()).unwrap_or("");
-            match type_ {
-                "explanation" => {
-                    if let Some(content) = element.get("content").and_then(|v| v.as_str())
-                        && !content.is_empty()
-                    {
-                        def_parts.push(content.to_string());
-                    }
-                }
-                "example" => {
-                    if let Some(content) = element
-                        .get("quote")
-                        .and_then(|q| q.get("content"))
-                        .and_then(|v| v.as_str())
-                        && !content.is_empty()
-                    {
-                        ex_parts.push(content.to_string());
-                    }
-                }
-                "sub_article" => {
-                    for s in element
-                        .get("lemmas")
-                        .and_then(|v| v.as_array())
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|l| l.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        if !sub_lemmas.contains(&s.to_string()) {
-                            sub_lemmas.push(s.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(sub_defs) = def.get("sub_definitions").and_then(|v| v.as_array()) {
-            extract_definition_content(sub_defs, def_parts, ex_parts, sub_lemmas);
-        }
-    }
-}
-
-struct LemmaData {
-    lemmas: Vec<String>,
-    suggest: Vec<String>,
-    inflections: Vec<String>,
-    paradigm_tags: Vec<String>,
-    inflection_tags: Vec<String>,
-    has_split_inf: bool,
-}
-
-fn extract_lemma_data(data: &serde_json::Value) -> LemmaData {
-    let mut lemmas = Vec::new();
-    let mut inflections = Vec::new();
-    let mut paradigm_tags = Vec::new();
-    let mut inflection_tags = Vec::new();
-    let mut has_split_inf = false;
-
-    for lemma_obj in data
-        .get("lemmas")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        if let Some(lemma_str) = lemma_obj.get("lemma").and_then(|v| v.as_str()) {
-            lemmas.push(lemma_str.to_string());
-        }
-        if lemma_obj
-            .get("split_inf")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            has_split_inf = true;
-        }
-        for paradigm in lemma_obj
-            .get("paradigm_info")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            for s in paradigm
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|tag| tag.as_str())
-            {
-                if !paradigm_tags.contains(&s.to_string()) {
-                    paradigm_tags.push(s.to_string());
-                }
-            }
-            for infl in paradigm
-                .get("inflection")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-            {
-                if let Some(wf) = infl.get("word_form").and_then(|v| v.as_str())
-                    && !inflections.contains(&wf.to_string())
-                {
-                    inflections.push(wf.to_string());
-                }
-                for s in infl
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|tag| tag.as_str())
-                {
-                    if !inflection_tags.contains(&s.to_string()) {
-                        inflection_tags.push(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let suggest: Vec<String> = data
-        .get("suggest")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.as_str())
-        .map(String::from)
-        .collect();
-
-    LemmaData {
-        lemmas,
-        suggest,
-        inflections,
-        paradigm_tags,
-        inflection_tags,
-        has_split_inf,
-    }
-}
-
-struct BodyContent {
-    etymology_parts: Vec<String>,
-    etymology_languages: Vec<String>,
-    pronunciation_parts: Vec<String>,
-    dialect_form_parts: Vec<String>,
-    dialect_places: Vec<String>,
-    written_forms: Vec<String>,
-    definition_parts: Vec<String>,
-    example_parts: Vec<String>,
-    sub_article_lemmas: Vec<String>,
-}
-
-/// Extract dialect forms and places from the dialect part of the article.
-fn extract_dialect_content(
-    dialect_arr: &[serde_json::Value],
-    dialect_form_parts: &mut Vec<String>,
-    dialect_places: &mut Vec<String>,
-) {
-    for dialect in dialect_arr {
-        let Some(subcats) = dialect.get("subcats").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for subcat in subcats {
-            let Some(forms) = subcat.get("forms").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for form in forms {
-                if let Some(form_str) = form.get("form").and_then(|v| v.as_str()) {
-                    if !form_str.is_empty() && !dialect_form_parts.contains(&form_str.to_string()) {
-                        dialect_form_parts.push(form_str.to_string());
-                    }
-                } else if let Some(form_obj) = form.get("form").and_then(|v| v.as_object())
-                    && let Some(content) = form_obj.get("content").and_then(|v| v.as_str())
-                    && !content.is_empty()
-                    && !dialect_form_parts.contains(&content.to_string())
-                {
-                    dialect_form_parts.push(content.to_string());
-                }
-                for source in form
-                    .get("sources")
-                    .and_then(|v| v.as_array())
-                    .into_iter()
-                    .flatten()
-                {
-                    let show = source
-                        .get("show")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
-                    if show == 1
-                        && let Some(name) = source.get("place_name").and_then(|v| v.as_str())
-                        && !dialect_places.contains(&name.to_string())
-                    {
-                        dialect_places.push(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Recursively extract body content from the article.
-fn extract_body_content(
-    data: &serde_json::Value,
-    concepts: &crate::extraction::ConceptMap,
-) -> BodyContent {
-    let mut etymology_parts = Vec::new();
-    let mut etymology_languages = Vec::new();
-    let mut pronunciation_parts = Vec::new();
-    let mut dialect_form_parts: Vec<String> = Vec::new();
-    let mut dialect_places = Vec::new();
-    let mut written_forms: Vec<String> = Vec::new();
-    let mut definition_parts = Vec::new();
-    let mut example_parts = Vec::new();
-    let mut sub_article_lemmas: Vec<String> = Vec::new();
-
-    let body = data.get("body");
-
-    // Etymology.
-    for etym in body
-        .and_then(|b| b.get("etymology"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        if let Some(content) = etym.get("content").and_then(|v| v.as_str()) {
-            let items = etym
-                .get("items")
-                .and_then(|v| v.as_array())
-                .map_or(&[] as &[_], Vec::as_slice);
-            let text = crate::extraction::format_element_text(content, items, concepts);
-            let text = text.trim();
-            if !text.is_empty() {
-                etymology_parts.push(text.to_string());
-            }
-        }
-
-        for item in etym
-            .get("items")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            if item.get("type_").and_then(|v| v.as_str()) == Some("language")
-                && let Some(id) = item.get("id").and_then(|v| v.as_str())
-                && !id.is_empty()
-                && !etymology_languages.contains(&id.to_string())
-            {
-                etymology_languages.push(id.to_string());
-            }
-        }
-    }
-
-    for content in body
-        .and_then(|b| b.get("pronunciation"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|pron| pron.get("content").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty())
-    {
-        pronunciation_parts.push(content.to_string());
-    }
-
-    if let Some(dialect_arr) = body
-        .and_then(|b| b.get("dialect"))
-        .and_then(|v| v.as_array())
-    {
-        extract_dialect_content(dialect_arr, &mut dialect_form_parts, &mut dialect_places);
-    }
-
-    for wf_str in body
-        .and_then(|b| b.get("written_form"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .flat_map(|wf| {
-            wf.get("forms")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|form| form.get("written_form").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty())
-    {
-        if !written_forms.contains(&wf_str.to_string()) {
-            written_forms.push(wf_str.to_string());
-        }
-    }
-
-    if let Some(defs) = body
-        .and_then(|b| b.get("definitions"))
-        .and_then(|v| v.as_array())
-    {
-        extract_definition_content(
-            defs,
-            &mut definition_parts,
-            &mut example_parts,
-            &mut sub_article_lemmas,
-        );
-    }
-
-    BodyContent {
-        etymology_parts,
-        etymology_languages,
-        pronunciation_parts,
-        dialect_form_parts,
-        dialect_places,
-        written_forms,
-        definition_parts,
-        example_parts,
-        sub_article_lemmas,
-    }
 }
 
 /// Build an ArticleSearchDocument from an article.
@@ -816,12 +188,21 @@ pub fn build_search_document(
     dictionary: &str,
     article_id: i64,
     data: &serde_json::Value,
-    bibliography: Option<&ArticleBibliography>,
-    place_data: Option<&ArticlePlaceData>,
+    bibliography: Option<ArticleBibliography>,
+    place_data: Option<ArticlePlaceData>,
     concepts: &crate::extraction::ConceptMap,
 ) -> ArticleSearchDocument {
-    let lemma_data = extract_lemma_data(data);
-    let body = extract_body_content(data, concepts);
+    let lemma_data = crate::extraction::extract_lemma_data(data);
+    let body = crate::extraction::extract_body_content(data, concepts);
+    let ArticleBibliography {
+        older_source,
+        written_form_source,
+        attestation_source,
+        all: all_bib,
+        ..
+    } = bibliography.unwrap_or_default();
+
+    let place = place_data.unwrap_or_default();
 
     ArticleSearchDocument {
         id: format!("{dictionary}_{article_id}"),
@@ -837,91 +218,31 @@ pub fn build_search_document(
         inflection_tags: lemma_data.inflection_tags,
         has_split_inf: lemma_data.has_split_inf,
         dialect_places: body.dialect_places,
-        older_source_codes: bibliography
-            .as_ref()
-            .map(|b| b.older_source.codes.clone())
-            .unwrap_or_default(),
-        older_source_authors: bibliography
-            .as_ref()
-            .map(|b| b.older_source.authors.clone())
-            .unwrap_or_default(),
-        older_source_titles: bibliography
-            .as_ref()
-            .map(|b| b.older_source.titles.clone())
-            .unwrap_or_default(),
-        older_source_years: bibliography
-            .as_ref()
-            .map(|b| b.older_source.years.clone())
-            .unwrap_or_default(),
-        written_form_source_codes: bibliography
-            .as_ref()
-            .map(|b| b.written_form_source.codes.clone())
-            .unwrap_or_default(),
-        written_form_source_authors: bibliography
-            .as_ref()
-            .map(|b| b.written_form_source.authors.clone())
-            .unwrap_or_default(),
-        written_form_source_titles: bibliography
-            .as_ref()
-            .map(|b| b.written_form_source.titles.clone())
-            .unwrap_or_default(),
-        written_form_source_years: bibliography
-            .as_ref()
-            .map(|b| b.written_form_source.years.clone())
-            .unwrap_or_default(),
-        attestation_source_codes: bibliography
-            .as_ref()
-            .map(|b| b.attestation_source.codes.clone())
-            .unwrap_or_default(),
-        attestation_source_authors: bibliography
-            .as_ref()
-            .map(|b| b.attestation_source.authors.clone())
-            .unwrap_or_default(),
-        attestation_source_titles: bibliography
-            .as_ref()
-            .map(|b| b.attestation_source.titles.clone())
-            .unwrap_or_default(),
-        attestation_source_years: bibliography
-            .as_ref()
-            .map(|b| b.attestation_source.years.clone())
-            .unwrap_or_default(),
-        bibliography_codes: bibliography
-            .as_ref()
-            .map(|b| b.all.codes.clone())
-            .unwrap_or_default(),
-        bibliography_authors: bibliography
-            .as_ref()
-            .map(|b| b.all.authors.clone())
-            .unwrap_or_default(),
-        bibliography_titles: bibliography
-            .as_ref()
-            .map(|b| b.all.titles.clone())
-            .unwrap_or_default(),
-        bibliography_years: bibliography
-            .as_ref()
-            .map(|b| b.all.years.clone())
-            .unwrap_or_default(),
-        place_names: place_data.map(|p| p.names.clone()).unwrap_or_default(),
-        place_codes: place_data.map(|p| p.codes.clone()).unwrap_or_default(),
-        place_types: place_data.map(|p| p.types.clone()).unwrap_or_default(),
-        dialect_place_names: place_data
-            .map(|p| p.dialect_names.clone())
-            .unwrap_or_default(),
-        dialect_place_codes: place_data
-            .map(|p| p.dialect_codes.clone())
-            .unwrap_or_default(),
-        dialect_place_types: place_data
-            .map(|p| p.dialect_types.clone())
-            .unwrap_or_default(),
-        attestation_place_names: place_data
-            .map(|p| p.attestation_names.clone())
-            .unwrap_or_default(),
-        attestation_place_codes: place_data
-            .map(|p| p.attestation_codes.clone())
-            .unwrap_or_default(),
-        attestation_place_types: place_data
-            .map(|p| p.attestation_types.clone())
-            .unwrap_or_default(),
+        older_source_codes: older_source.codes,
+        older_source_authors: older_source.authors,
+        older_source_titles: older_source.titles,
+        older_source_years: older_source.years,
+        written_form_source_codes: written_form_source.codes,
+        written_form_source_authors: written_form_source.authors,
+        written_form_source_titles: written_form_source.titles,
+        written_form_source_years: written_form_source.years,
+        attestation_source_codes: attestation_source.codes,
+        attestation_source_authors: attestation_source.authors,
+        attestation_source_titles: attestation_source.titles,
+        attestation_source_years: attestation_source.years,
+        bibliography_codes: all_bib.codes,
+        bibliography_authors: all_bib.authors,
+        bibliography_titles: all_bib.titles,
+        bibliography_years: all_bib.years,
+        place_names: place.names,
+        place_codes: place.codes,
+        place_types: place.types,
+        dialect_place_names: place.dialect_names,
+        dialect_place_codes: place.dialect_codes,
+        dialect_place_types: place.dialect_types,
+        attestation_place_names: place.attestation_names,
+        attestation_place_codes: place.attestation_codes,
+        attestation_place_types: place.attestation_types,
         etymology_languages: body.etymology_languages,
         definition_text: body.definition_parts.join(" "),
         example_text: body.example_parts.join(" "),
@@ -1178,10 +499,13 @@ async fn reindex_articles(client: &Client, db: &PgPool) -> Result<()> {
             .fetch_all(db)
             .await?;
 
-    let mut article_place_map: std::collections::HashMap<(String, i64), (Vec<i64>, Vec<i64>)> =
-        std::collections::HashMap::new();
+    let mut article_place_map: crate::storage::ArticlePlaceMap = std::collections::HashMap::new();
     for (dict, article_id, place_id, context) in article_place_rows {
-        let entry = article_place_map.entry((dict, article_id)).or_default();
+        let entry = article_place_map
+            .entry(dict)
+            .or_default()
+            .entry(article_id)
+            .or_default();
         match context.as_str() {
             "dialect" => entry.0.push(place_id),
             "attestation" => entry.1.push(place_id),
@@ -1214,21 +538,25 @@ async fn reindex_articles(client: &Client, db: &PgPool) -> Result<()> {
 
         let mut batch: Vec<ArticleSearchDocument> = Vec::with_capacity(5000);
         let mut tasks = Vec::new();
+        let dict_places = article_place_map.get(dict);
+        let empty_place = (Vec::new(), Vec::new());
 
         while let Some(row) = stream.next().await {
             let (id, data) = row?;
-            let bib = build_article_bibliography(&data, &bib_map);
-            let (dialect_ids, attestation_ids) = article_place_map
-                .get(&(dict.to_string(), id))
-                .cloned()
-                .unwrap_or_default();
-            let places = build_article_place_data_split(&dialect_ids, &attestation_ids, &place_map);
+            let bib = crate::extraction::build_article_bibliography(&data, &bib_map);
+            let (dialect_ids, attestation_ids) =
+                dict_places.and_then(|m| m.get(&id)).unwrap_or(&empty_place);
+            let places = crate::extraction::build_article_place_data(
+                dialect_ids,
+                attestation_ids,
+                &place_map,
+            );
             batch.push(build_search_document(
                 dict,
                 id,
                 &data,
-                Some(&bib),
-                Some(&places),
+                Some(bib),
+                Some(places),
                 &concepts,
             ));
 
@@ -1268,22 +596,22 @@ async fn reindex_bibliography(client: &Client, db: &PgPool) -> Result<()> {
 
     info!("  [bibliography] Re-indexing {} entries…", rows.len());
 
-    let mut tasks = Vec::new();
-    for chunk in rows.chunks(5000) {
-        let docs: Vec<BibliographySearchDocument> = chunk
-            .iter()
-            .map(
-                |(id, code, author, title, year)| BibliographySearchDocument {
-                    id: *id,
-                    code: code.clone(),
-                    author: author.clone(),
-                    title: title.clone(),
-                    year: year.clone(),
-                },
-            )
-            .collect();
+    let docs: Vec<BibliographySearchDocument> = rows
+        .into_iter()
+        .map(
+            |(id, code, author, title, year)| BibliographySearchDocument {
+                id,
+                code,
+                author,
+                title,
+                year,
+            },
+        )
+        .collect();
 
-        tasks.push(idx.add_or_replace(&docs, Some("id")).await?);
+    let mut tasks = Vec::new();
+    for chunk in docs.chunks(5000) {
+        tasks.push(idx.add_or_replace(chunk, Some("id")).await?);
     }
 
     let timeout = Some(std::time::Duration::from_mins(1));
@@ -1343,187 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_search_document_noun_with_inflections() {
-        let data = json!({
-            "lemmas": [
-                {
-                    "hgno": 0,
-                    "id": 90001,
-                    "lemma": "fjordsting",
-                    "split_inf": false,
-                    "inflection_class": "m1, f1",
-                    "paradigm_info": [
-                        {
-                            "from": "1996-01-01",
-                            "to": null,
-                            "inflection_group": "NOUN_regular",
-                            "paradigm_id": 564,
-                            "standardisation": "STANDARD",
-                            "tags": ["NOUN", "Masc"],
-                            "inflection": [
-                                { "word_form": "fjordsting", "tags": ["Sing", "Ind"] },
-                                { "word_form": "fjordstingen", "tags": ["Sing", "Def"] },
-                                { "word_form": "fjordstinger", "tags": ["Plur", "Ind"] },
-                                { "word_form": "fjordstingene", "tags": ["Plur", "Def"] },
-                            ]
-                        },
-                        {
-                            "from": "1996-01-01",
-                            "to": null,
-                            "inflection_group": "NOUN_regular",
-                            "paradigm_id": 760,
-                            "standardisation": "STANDARD",
-                            "tags": ["NOUN", "Fem"],
-                            "inflection": [
-                                { "word_form": "fjordsting", "tags": ["Sing", "Ind"] },
-                                { "word_form": "fjordstinga", "tags": ["Sing", "Def"] },
-                                { "word_form": "fjordstinger", "tags": ["Plur", "Ind"] },
-                                { "word_form": "fjordstingene", "tags": ["Plur", "Def"] },
-                            ]
-                        }
-                    ]
-                }
-            ],
-            "suggest": ["fjordsting"],
-            "body": {
-                "pronunciation": [],
-                "etymology": [
-                    {
-                        "type_": "etymology_language",
-                        "content": "av norrønt $ $",
-                        "items": [
-                            { "type_": "usage", "text": "fjǫrðr" },
-                            { "type_": "usage", "text": "þing" },
-                        ]
-                    }
-                ],
-                "definitions": []
-            }
-        });
-
-        let concepts = std::collections::HashMap::new();
-        let doc = build_search_document("bm", 55001, &data, None, None, &concepts);
-
-        assert_eq!(doc.id, "bm_55001");
-        assert_eq!(doc.article_id, 55001);
-        assert_eq!(doc.dictionary, "bm");
-        assert_eq!(doc.lemmas, vec!["fjordsting"]);
-        assert_eq!(doc.suggest, vec!["fjordsting"]);
-        assert_eq!(
-            doc.inflections,
-            vec![
-                "fjordsting",
-                "fjordstingen",
-                "fjordstinger",
-                "fjordstingene",
-                "fjordstinga",
-            ]
-        );
-        assert_eq!(doc.paradigm_tags, vec!["NOUN", "Masc", "Fem"]);
-        assert_eq!(doc.inflection_tags, vec!["Sing", "Ind", "Def", "Plur"]);
-        assert_eq!(doc.etymology_text, "av norrønt fjǫrðr þing");
-        assert!(!doc.has_split_inf);
-        assert!(doc.dialect_places.is_empty());
-        assert!(doc.older_source_codes.is_empty());
-        assert!(doc.written_form_source_codes.is_empty());
-        assert!(doc.attestation_source_codes.is_empty());
-    }
-
-    #[test]
-    fn test_build_search_document_abbreviation() {
-        let data = json!({
-            "lemmas": [
-                {
-                    "hgno": 1,
-                    "id": 90002,
-                    "lemma": "F",
-                    "paradigm_info": [
-                        {
-                            "from": "1996-01-01",
-                            "to": null,
-                            "inflection_group": "ABBR",
-                            "paradigm_id": 40,
-                            "standardisation": "STANDARD",
-                            "tags": ["ABBR"],
-                            "inflection": [
-                                { "word_form": "F", "tags": [] }
-                            ]
-                        }
-                    ]
-                },
-                {
-                    "hgno": 1,
-                    "id": 90003,
-                    "lemma": "f",
-                    "paradigm_info": [
-                        {
-                            "from": "1996-01-01",
-                            "to": null,
-                            "inflection_group": "ABBR",
-                            "paradigm_id": 40,
-                            "standardisation": "STANDARD",
-                            "tags": ["ABBR"],
-                            "inflection": [
-                                { "word_form": "f", "tags": [] }
-                            ]
-                        }
-                    ]
-                }
-            ],
-            "suggest": ["F", "f"]
-        });
-
-        let concepts = std::collections::HashMap::new();
-        let doc = build_search_document("bm", 90000, &data, None, None, &concepts);
-
-        assert_eq!(doc.lemmas, vec!["F", "f"]);
-        assert_eq!(doc.suggest, vec!["F", "f"]);
-        assert_eq!(doc.inflections, vec!["F", "f"]);
-        assert_eq!(doc.paradigm_tags, vec!["ABBR"]);
-        assert!(doc.inflection_tags.is_empty());
-        assert_eq!(doc.etymology_text, "");
-        assert!(!doc.has_split_inf);
-    }
-
-    #[test]
-    fn test_build_search_document_verb_split_inf() {
-        let data = json!({
-            "lemmas": [
-                {
-                    "hgno": 0,
-                    "id": 90004,
-                    "lemma": "velja",
-                    "split_inf": true,
-                    "paradigm_info": [
-                        {
-                            "from": "2012-01-01",
-                            "to": null,
-                            "inflection_group": "VERB_regular",
-                            "paradigm_id": 1100,
-                            "standardisation": "STANDARD",
-                            "tags": ["VERB"],
-                            "inflection": [
-                                { "word_form": "vel", "tags": ["Pres"] },
-                                { "word_form": "valde", "tags": ["Past"] },
-                            ]
-                        }
-                    ]
-                }
-            ],
-            "suggest": ["velja"]
-        });
-
-        let concepts = std::collections::HashMap::new();
-        let doc = build_search_document("nn", 70001, &data, None, None, &concepts);
-
-        assert!(doc.has_split_inf);
-        assert_eq!(doc.lemmas, vec!["velja"]);
-        assert_eq!(doc.inflections, vec!["vel", "valde"]);
-        assert_eq!(doc.paradigm_tags, vec!["VERB"]);
-        assert_eq!(doc.inflection_tags, vec!["Pres", "Past"]);
-    }
-
-    #[test]
     fn test_build_search_document_empty_data() {
         let data = json!({});
         let concepts = std::collections::HashMap::new();
@@ -1544,131 +691,29 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn test_build_search_document_no_with_dialect_and_sources() {
+    fn test_build_search_document_assembles_fields() {
         let data = json!({
             "lemmas": [
                 {
-                    "id": 90010,
-                    "lemma": "trollskog",
+                    "lemma": "test",
                     "paradigm_info": [
                         {
-                            "tags": ["NOUN", "Masc"],
+                            "tags": ["NOUN"],
                             "inflection": [
-                                { "word_form": "trollskog", "tags": ["Sing", "Ind"] }
+                                { "word_form": "test", "tags": ["Sing"] }
                             ]
                         }
                     ]
                 }
             ],
-            "suggest": [],
-            "body": {
-                "pronunciation": [{ "items": [{ "text": "trållskåg", "type_": "text" }] }],
-                "etymology": [
-                    {
-                        "type_": "etymology_lang",
-                        "items": [{ "text": "trollskógr", "type_": "usage" }]
-                    }
-                ],
-                "dialect": [
-                    {
-                        "subcats": [
-                            {
-                                "forms": [
-                                    {
-                                        "form": "trållskåg",
-                                        "sources": [
-                                            { "show": 1, "place_name": "Nordfjell", "place_id": 2 },
-                                            { "show": 0, "place_name": "Sørdal", "place_id": 41 },
-                                            { "show": 1, "place_name": "Vestmark", "place_id": 85 }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ],
-                "older_source": [
-                    { "code": "FiktA", "bibl_id": 100 },
-                    { "code": "FiktB", "bibl_id": 200 }
-                ],
-                "written_form": [
-                    {
-                        "forms": [
-                            {
-                                "written_form": "trollskog",
-                                "sources": [
-                                    { "code": "E.DiktAS", "bibl_id": 2027 },
-                                    { "code": "SagaOH", "bibl_id": 10482 }
-                                ]
-                            }
-                        ]
-                    }
-                ],
-                "definitions": [
-                    {
-                        "elements": [
-                            {
-                                "place_refs": [
-                                    { "vis": 1, "code": "X", "place_name": "Nordfjell" },
-                                    { "vis": 0, "code": "Y", "place_name": "Sørdal" }
-                                ]
-                            }
-                        ],
-                        "literature_refs": [
-                            { "code": "FiktSag" },
-                            { "code": "TrollRef" }
-                        ]
-                    }
-                ]
-            }
+            "suggest": ["test"]
         });
-
-        let mut bib_map = std::collections::HashMap::new();
-        bib_map.insert(
-            100,
-            (
-                "FiktA".to_string(),
-                "Author A".to_string(),
-                "Title A".to_string(),
-                "2000".to_string(),
-            ),
-        );
-        bib_map.insert(
-            200,
-            (
-                "FiktB".to_string(),
-                "Author B".to_string(),
-                "Title B".to_string(),
-                "2001".to_string(),
-            ),
-        );
-        bib_map.insert(
-            2027,
-            (
-                "E.DiktAS".to_string(),
-                "Dikt Author".to_string(),
-                "Dikt Title".to_string(),
-                "1990".to_string(),
-            ),
-        );
-        bib_map.insert(
-            10482,
-            (
-                "SagaOH".to_string(),
-                "Saga Author".to_string(),
-                "Saga Title".to_string(),
-                "1850".to_string(),
-            ),
-        );
-
-        let bib = build_article_bibliography(&data, &bib_map);
         let concepts = std::collections::HashMap::new();
-        let doc = build_search_document("no", 99001, &data, Some(&bib), None, &concepts);
+        let doc = build_search_document("bm", 1, &data, None, None, &concepts);
 
-        assert_eq!(doc.dialect_places, vec!["Nordfjell", "Vestmark"]);
-        assert_eq!(doc.older_source_codes, vec!["FiktA", "FiktB"]);
-        assert_eq!(doc.written_form_source_codes, vec!["E.DiktAS", "SagaOH"]);
-        assert!(doc.attestation_source_codes.is_empty());
+        assert_eq!(doc.id, "bm_1");
+        assert_eq!(doc.article_id, 1);
+        assert_eq!(doc.dictionary, "bm");
+        assert_eq!(doc.lemmas, vec!["test"]);
     }
 }

@@ -150,22 +150,51 @@ impl UibClient {
         }
     }
 
-    /// Fetch the article list for a dictionary.
-    pub async fn fetch_article_list(&self, dict: UibDictionary) -> Result<Vec<Value>> {
-        let url = format!("https://ord.uib.no/{}/fil/article.json", dict.as_str());
-        self.with_retry(&format!("fetch_article_list({dict})"), || {
+    /// Fetch JSON from a public URL.
+    async fn fetch_public_json(&self, desc: &str, url: &str) -> Result<Value> {
+        let url = url.to_string();
+        self.with_retry(desc, || {
             let url = url.clone();
             let client = self.client.clone();
             async move {
                 let resp = client.get(&url).send().await?.error_for_status()?;
-                let data: Value = resp.json().await?;
-                let arr = data
-                    .as_array()
-                    .ok_or_else(|| anyhow!("Expected JSON array."))?;
-                Ok(arr.clone())
+                Ok(resp.json().await?)
             }
         })
         .await
+    }
+
+    /// Fetch JSON from an authenticated URL.
+    async fn fetch_authed_json(&self, desc: &str, url: &str) -> Result<Value> {
+        let key = self.clarino_key()?.to_string();
+        let url = url.to_string();
+        self.with_retry(desc, || {
+            let url = url.clone();
+            let client = self.client.clone();
+            let key = key.clone();
+            async move {
+                let resp = client
+                    .get(&url)
+                    .header("x-api-key", &key)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok(resp.json().await?)
+            }
+        })
+        .await
+    }
+
+    /// Fetch the article list for a dictionary.
+    pub async fn fetch_article_list(&self, dict: UibDictionary) -> Result<Vec<Value>> {
+        let url = format!("https://ord.uib.no/{}/fil/article.json", dict.as_str());
+        let data = self
+            .fetch_public_json(&format!("fetch_article_list({dict})"), &url)
+            .await?;
+        match data {
+            Value::Array(arr) => Ok(arr),
+            _ => Err(anyhow!("Expected JSON array.")),
+        }
     }
 
     /// Fetch a single article.
@@ -175,43 +204,22 @@ impl UibClient {
             dict.as_str(),
             article_id
         );
-        self.with_retry(&format!("fetch_article({dict}, {article_id})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            async move {
-                let resp = client.get(&url).send().await?.error_for_status()?;
-                Ok(resp.json().await?)
-            }
-        })
-        .await
+        self.fetch_public_json(&format!("fetch_article({dict}, {article_id})"), &url)
+            .await
     }
 
     /// Fetch dictionary concepts.
     pub async fn fetch_concepts(&self, dict: UibDictionary) -> Result<Value> {
         let url = format!("https://ord.uib.no/{}/concepts.json", dict.as_str());
-        self.with_retry(&format!("fetch_concepts({dict})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            async move {
-                let resp = client.get(&url).send().await?.error_for_status()?;
-                Ok(resp.json().await?)
-            }
-        })
-        .await
+        self.fetch_public_json(&format!("fetch_concepts({dict})"), &url)
+            .await
     }
 
     /// Fetch dictionary word classes.
     pub async fn fetch_word_classes(&self, dict: UibDictionary) -> Result<Value> {
         let url = format!("https://ord.uib.no/{}/fil/word_class.json", dict.as_str());
-        self.with_retry(&format!("fetch_word_classes({dict})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            async move {
-                let resp = client.get(&url).send().await?.error_for_status()?;
-                Ok(resp.json().await?)
-            }
-        })
-        .await
+        self.fetch_public_json(&format!("fetch_word_classes({dict})"), &url)
+            .await
     }
 
     /// Fetch dictionary word subclasses.
@@ -220,89 +228,44 @@ impl UibClient {
             "https://ord.uib.no/{}/fil/sub_word_class.json",
             dict.as_str()
         );
-        self.with_retry(&format!("fetch_word_subclasses({dict})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            async move {
-                let resp = client.get(&url).send().await?.error_for_status()?;
-                Ok(resp.json().await?)
-            }
-        })
-        .await
+        self.fetch_public_json(&format!("fetch_word_subclasses({dict})"), &url)
+            .await
     }
 
     /// Fetch a single bibliography entry by ID.
     pub async fn fetch_bibliography(&self, bibl_id: i64) -> Result<Value> {
-        let api_key = self.clarino_key()?;
         let url = format!("https://clarino.uib.no/ordbank-api-prod/bibl/{bibl_id}");
-        let key = api_key.to_string();
-        self.with_retry(&format!("fetch_bibliography({bibl_id})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            let key = key.clone();
-            async move {
-                let resp = client
-                    .get(&url)
-                    .header("x-api-key", &key)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                let data: Value = resp.json().await?;
-                data.as_array()
-                    .and_then(|arr| arr.first())
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Empty response for bibliography {bibl_id}"))
-            }
-        })
-        .await
+        let data = self
+            .fetch_authed_json(&format!("fetch_bibliography({bibl_id})"), &url)
+            .await?;
+        data.as_array()
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| anyhow!("Empty response for bibliography {bibl_id}"))
     }
 
     /// Fetch bibliography entries by code.
     pub async fn fetch_bibliography_by_code(&self, code: &str) -> Result<Vec<Value>> {
-        let api_key = self.clarino_key()?;
         let encoded = urlencoding::encode(code);
         let url = format!("https://clarino.uib.no/ordbank-api-prod/bibl?code={encoded}");
-        let key = api_key.to_string();
-        self.with_retry(&format!("fetch_bibl_by_code({code})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            let key = key.clone();
-            async move {
-                let resp = client
-                    .get(&url)
-                    .header("x-api-key", &key)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                Ok(resp.json().await?)
-            }
-        })
-        .await
+        let data = self
+            .fetch_authed_json(&format!("fetch_bibl_by_code({code})"), &url)
+            .await?;
+        match data {
+            Value::Array(arr) => Ok(arr),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Fetch a single place entry by ID.
     pub async fn fetch_place(&self, place_id: i64) -> Result<Value> {
-        let api_key = self.clarino_key()?;
         let url = format!("https://clarino.uib.no/ordbank-api-prod/place/{place_id}");
-        let key = api_key.to_string();
-        self.with_retry(&format!("fetch_place({place_id})"), || {
-            let url = url.clone();
-            let client = self.client.clone();
-            let key = key.clone();
-            async move {
-                let resp = client
-                    .get(&url)
-                    .header("x-api-key", &key)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                let data: Value = resp.json().await?;
-                data.get(place_id.to_string())
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Empty response for place {place_id}"))
-            }
-        })
-        .await
+        let data = self
+            .fetch_authed_json(&format!("fetch_place({place_id})"), &url)
+            .await?;
+        data.get(place_id.to_string())
+            .cloned()
+            .ok_or_else(|| anyhow!("Empty response for place {place_id}"))
     }
 
     /// Fetch a place by name.
@@ -327,11 +290,11 @@ impl UibClient {
                     let resp = resp.error_for_status()?;
                     let data: Value = resp.json().await?;
 
-                    if let Some(obj) = data.as_object()
-                        && let Some((id_str, entry)) = obj.iter().next()
+                    if let Value::Object(obj) = data
+                        && let Some((id_str, entry)) = obj.into_iter().next()
                         && let Ok(place_id) = id_str.parse::<i64>()
                     {
-                        return Ok(Some((place_id, entry.clone())));
+                        return Ok(Some((place_id, entry)));
                     }
 
                     Ok(None)

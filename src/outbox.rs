@@ -19,20 +19,24 @@
 use anyhow::Result;
 use apalis::prelude::*;
 use apalis_redis::RedisStorage;
+use indexmap::IndexSet;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
-    BatchIndexJob, FetchArticleJob, FetchBibliographyJob, FetchPlaceJob, IndexArticleJob,
-    ResolveInlineCodeJob,
+    BatchIndexJob, FetchArticleJob, FetchBibliographyJob, FetchPlaceJob, ResolveInlineCodeJob,
 };
+
+/// How many jobs get fetched from the outbox each poll.
+const OUTBOX_POLL_LIMIT: i16 = 200;
+/// Target number of article keys per coalesced batch index job.
+const BATCH_INDEX_COALESCE_LIMIT: i32 = 5000;
 
 /// Redis storages needed for the outbox poller to dispatch jobs.
 pub struct OutboxStorages {
     pub fetch_article: RedisStorage<FetchArticleJob>,
-    pub index_article: RedisStorage<IndexArticleJob>,
     pub batch_index: RedisStorage<BatchIndexJob>,
     pub fetch_bibliography: RedisStorage<FetchBibliographyJob>,
     pub fetch_place: RedisStorage<FetchPlaceJob>,
@@ -54,36 +58,54 @@ pub async fn run_outbox_poller(db: PgPool, storages: OutboxStorages) {
 }
 
 async fn poll_once(db: &PgPool, storages: &OutboxStorages) -> Result<()> {
+    let mut processed_ids: Vec<i64> = Vec::new();
+
+    let batch_entries: Vec<(i64, Value)> =
+        sqlx::query_as("SELECT id, payload FROM outbox_drain_batch_index($1)")
+            .bind(BATCH_INDEX_COALESCE_LIMIT)
+            .fetch_all(db)
+            .await?;
+
+    let mut coalesced_batch_keys: IndexSet<String> = IndexSet::new();
+    for (id, payload) in &batch_entries {
+        if let Some(arr) = payload["article_keys"].as_array() {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    coalesced_batch_keys.insert(s.to_string());
+                }
+            }
+        }
+        processed_ids.push(*id);
+    }
+
+    if !coalesced_batch_keys.is_empty() {
+        debug!(
+            "Outbox: coalesced batch_index with {} unique article keys.",
+            coalesced_batch_keys.len()
+        );
+        let mut storage = storages.batch_index.clone();
+        if let Err(e) = storage
+            .push(BatchIndexJob {
+                article_keys: coalesced_batch_keys.into_iter().collect(),
+            })
+            .await
+        {
+            error!("Failed to push coalesced batch_index: {e}");
+        }
+    }
+
     let entries: Vec<(i64, String, Value)> = sqlx::query_as(
         "SELECT id, job_type, payload FROM job_outbox
-         WHERE processed_at IS NULL
+         WHERE processed_at IS NULL AND job_type != 'batch_index'
          ORDER BY id
-         LIMIT 200
+         LIMIT $1
          FOR UPDATE SKIP LOCKED",
     )
+    .bind(OUTBOX_POLL_LIMIT)
     .fetch_all(db)
     .await?;
 
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    let mut processed_ids: Vec<i64> = Vec::with_capacity(entries.len());
-    let mut coalesced_batch_keys: Vec<String> = Vec::new();
-
     for (id, job_type, payload) in &entries {
-        if job_type == "batch_index" {
-            if let Some(arr) = payload["article_keys"].as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        coalesced_batch_keys.push(s.to_string());
-                    }
-                }
-            }
-            processed_ids.push(*id);
-            continue;
-        }
-
         let result = dispatch_job(db, job_type, payload, storages).await;
 
         match result {
@@ -91,24 +113,6 @@ async fn poll_once(db: &PgPool, storages: &OutboxStorages) -> Result<()> {
             Err(e) => {
                 warn!("Failed to dispatch outbox entry {id} of type {job_type}: {e:#}");
             }
-        }
-    }
-
-    if !coalesced_batch_keys.is_empty() {
-        coalesced_batch_keys.sort_unstable();
-        coalesced_batch_keys.dedup();
-        info!(
-            "Outbox: coalesced batch_index with {} unique article keys.",
-            coalesced_batch_keys.len()
-        );
-        let mut storage = storages.batch_index.clone();
-        if let Err(e) = storage
-            .push(BatchIndexJob {
-                article_keys: coalesced_batch_keys,
-            })
-            .await
-        {
-            error!("Failed to push coalesced batch_index: {e}");
         }
     }
 
@@ -140,42 +144,19 @@ async fn dispatch_job(
             if !crate::storage::ensure_article_pending_fetch(db, &dictionary, article_id).await? {
                 return Ok(());
             }
+            let revision = payload["revision"].as_i64();
+            let updated_at = payload["updated_at"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let mut storage = storages.fetch_article.clone();
             storage
                 .push(FetchArticleJob {
                     dictionary,
                     article_id,
+                    revision,
+                    updated_at,
                 })
-                .await
-                .map_err(|e| anyhow::anyhow!("Redis push failed: {e}"))?;
-        }
-        "index_article" => {
-            let dictionary = payload["dictionary"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let article_id = payload["article_id"].as_i64().unwrap_or_default();
-            let mut storage = storages.index_article.clone();
-            storage
-                .push(IndexArticleJob {
-                    dictionary,
-                    article_id,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Redis push failed: {e}"))?;
-        }
-        "batch_index" => {
-            let keys: Vec<String> = payload["article_keys"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut storage = storages.batch_index.clone();
-            storage
-                .push(BatchIndexJob { article_keys: keys })
                 .await
                 .map_err(|e| anyhow::anyhow!("Redis push failed: {e}"))?;
         }
@@ -301,7 +282,7 @@ pub async fn run_sweep(db: &PgPool) -> Result<()> {
         let dicts: Vec<&str> = stuck_fetch.iter().map(|(d, _)| d.as_str()).collect();
         let ids: Vec<i64> = stuck_fetch.iter().map(|(_, id)| *id).collect();
         sqlx::query(
-            "UPDATE articles SET status_changed_at = now()
+            "UPDATE articles SET sync_status = 'idle', status_changed_at = now()
              WHERE (dictionary, id) IN (SELECT * FROM UNNEST($1::text[], $2::bigint[]))",
         )
         .bind(&dicts)
@@ -333,10 +314,13 @@ pub async fn run_sweep(db: &PgPool) -> Result<()> {
 
     if !stuck_bibl.is_empty() {
         let ids: Vec<i64> = stuck_bibl.iter().map(|(id,)| *id).collect();
-        sqlx::query("UPDATE bibliography SET status_changed_at = now() WHERE id = ANY($1)")
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE bibliography SET sync_status = 'idle', status_changed_at = now()
+             WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
 
         for (bibl_id,) in &stuck_bibl {
             crate::storage::write_outbox_fetch_bibl(&mut tx, *bibl_id).await?;
@@ -345,10 +329,13 @@ pub async fn run_sweep(db: &PgPool) -> Result<()> {
 
     if !stuck_places.is_empty() {
         let ids: Vec<i64> = stuck_places.iter().map(|(id,)| *id).collect();
-        sqlx::query("UPDATE places SET status_changed_at = now() WHERE id = ANY($1)")
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE places SET sync_status = 'idle', status_changed_at = now()
+             WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
 
         for (place_id,) in &stuck_places {
             crate::storage::write_outbox_fetch_place(&mut tx, *place_id).await?;

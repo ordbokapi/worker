@@ -19,7 +19,7 @@
 use apalis::prelude::*;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, Request, WebSocketUpgrade, ws},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -56,10 +56,13 @@ pub struct WebState {
     pub db: PgPool,
     pub redis_conn: ConnectionManager,
     pub job_tracker: super::JobTracker,
+    pub sweep_storage: RedisStorage<super::jobs::SweepJob>,
     pub fetch_article_list_storage: RedisStorage<FetchArticleListJob>,
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
     pub secret_hash: Option<String>,
     pub session_key: [u8; 32],
+    #[cfg(feature = "dev_ui")]
+    pub reload_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 pub async fn routes(state: WebState) -> Router {
@@ -92,11 +95,12 @@ pub async fn routes(state: WebState) -> Router {
         .with_state(state.clone());
 
     let authed = Router::new()
-        .route("/api/stats", get(get_stats))
+        .route("/api/stats/ws", get(stats_ws))
         .route("/api/clear-queues", post(clear_queues))
         .route("/api/clear-outbox", post(clear_outbox))
         .route("/api/clear-all", post(clear_all))
         .route("/api/sync", post(trigger_sync))
+        .route("/api/sweep", post(trigger_sweep))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     #[allow(unused_mut)]
@@ -106,7 +110,15 @@ pub async fn routes(state: WebState) -> Router {
         .route("/api/auth-status", get(auth_status))
         .route("/api/logout", post(logout))
         .merge(login_route)
-        .merge(authed)
+        .merge(authed);
+
+    #[cfg(feature = "dev_ui")]
+    {
+        app = app.route("/api/dev-reload/ws", get(dev_reload_ws));
+    }
+
+    #[allow(unused_mut)]
+    let mut app = app
         .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn(security_headers))
         .with_state(state);
@@ -133,6 +145,50 @@ async fn serve_static_file(axum::extract::Path(path): axum::extract::Path<String
             ([(header::CONTENT_TYPE, content_type)], content).into_response()
         },
     )
+}
+
+#[cfg(feature = "dev_ui")]
+async fn dev_reload_ws(
+    wsu: WebSocketUpgrade,
+    axum::extract::State(state): axum::extract::State<WebState>,
+) -> Response {
+    wsu.on_upgrade(|mut socket| async move {
+        let mut rx = state.reload_tx.subscribe();
+        while rx.recv().await.is_ok() {
+            if socket
+                .send(ws::Message::Text("reload".into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+#[cfg(feature = "dev_ui")]
+pub fn spawn_static_watcher(tx: tokio::sync::broadcast::Sender<()>) {
+    use notify::{RecursiveMode, Watcher, event::ModifyKind};
+
+    std::thread::spawn(move || {
+        let (ntx, nrx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(ntx).expect("failed to create file watcher");
+        watcher
+            .watch(std::path::Path::new("static"), RecursiveMode::Recursive)
+            .expect("failed to watch static/");
+
+        for event in nrx.into_iter().flatten() {
+            let dominated_by_modify = matches!(
+                event.kind,
+                notify::EventKind::Modify(ModifyKind::Data(_))
+                    | notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+            );
+            if dominated_by_modify {
+                let _ = tx.send(());
+            }
+        }
+    });
 }
 
 async fn fetch_proxy_list_urls() -> Vec<ipnet::IpNet> {
@@ -388,7 +444,7 @@ fn serve_static(filename: &str) -> String {
     };
     content.replace(
         "</body>",
-        "<script src=\"/static/dev-reload.js\"></script></body>",
+        "<script type=\"module\" src=\"/static/dev-reload.js\"></script></body>",
     )
 }
 
@@ -414,9 +470,22 @@ async fn serve_ui(
         }
     }
 
+    let dictionaries: Vec<&str> = UibDictionary::all().iter().map(|d| d.as_str()).collect();
+    let queues: Vec<&str> = QUEUE_NAMESPACES
+        .iter()
+        .map(|ns| ns.strip_prefix("apalis:").unwrap_or(ns))
+        .collect();
+    let config_json = serde_json::json!({
+        "dictionaries": dictionaries,
+        "queueNamespaces": queues,
+    });
+    let config_script = format!("<script>window.__CONFIG__={config_json};</script>");
+    let html =
+        serve_static("management.html").replace("</head>", &format!("{config_script}</head>"));
+
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(serve_static("management.html")),
+        Html(html),
     )
         .into_response()
 }
@@ -462,6 +531,7 @@ async fn logout(
 struct QueueStats {
     namespace: String,
     pending: i64,
+    running: i64,
     failed: i64,
     dead: i64,
     done: i64,
@@ -493,100 +563,119 @@ struct DictionarySyncStats {
 }
 
 #[derive(Serialize)]
-struct Stats {
-    queues: Vec<QueueStats>,
-    outbox: OutboxStats,
-    articles: Vec<DictionarySyncStats>,
-    active_jobs: Vec<String>,
+#[serde(tag = "type", content = "data")]
+enum StatsMessage {
+    #[serde(rename = "queues")]
+    Queues(Vec<QueueStats>),
+    #[serde(rename = "active_jobs")]
+    ActiveJobs(Vec<String>),
+    #[serde(rename = "outbox")]
+    Outbox(OutboxStats),
+    #[serde(rename = "articles")]
+    Articles(Vec<DictionarySyncStats>),
 }
 
-async fn get_stats(
-    axum::extract::State(state): axum::extract::State<WebState>,
-) -> Result<Json<Stats>, StatusCode> {
-    let mut conn = state.redis_conn.clone();
-
+async fn fetch_queue_stats(conn: &mut ConnectionManager) -> Vec<QueueStats> {
     let mut queues = Vec::with_capacity(QUEUE_NAMESPACES.len());
     for &ns in QUEUE_NAMESPACES {
         let pending: i64 = redis::cmd("LLEN")
             .arg(format!("{ns}:active"))
-            .query_async(&mut conn)
+            .query_async(conn)
             .await
             .unwrap_or(0);
+        let workers: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(format!("{ns}:workers"))
+            .arg("0")
+            .arg("+inf")
+            .query_async(conn)
+            .await
+            .unwrap_or_default();
+        let mut running: i64 = 0;
+        for worker_set in &workers {
+            let count: i64 = redis::cmd("SCARD")
+                .arg(worker_set)
+                .query_async(conn)
+                .await
+                .unwrap_or(0);
+            running += count;
+        }
         let failed: i64 = redis::cmd("ZCARD")
             .arg(format!("{ns}:failed"))
-            .query_async(&mut conn)
+            .query_async(conn)
             .await
             .unwrap_or(0);
         let dead: i64 = redis::cmd("ZCARD")
             .arg(format!("{ns}:dead"))
-            .query_async(&mut conn)
+            .query_async(conn)
             .await
             .unwrap_or(0);
         let done: i64 = redis::cmd("ZCARD")
             .arg(format!("{ns}:done"))
-            .query_async(&mut conn)
+            .query_async(conn)
             .await
             .unwrap_or(0);
         let scheduled: i64 = redis::cmd("ZCARD")
             .arg(format!("{ns}:scheduled"))
-            .query_async(&mut conn)
+            .query_async(conn)
             .await
             .unwrap_or(0);
 
         queues.push(QueueStats {
-            namespace: ns.to_string(),
+            namespace: ns.strip_prefix("apalis:").unwrap_or(ns).to_string(),
             pending,
+            running,
             failed,
             dead,
             done,
             scheduled,
         });
     }
+    queues
+}
 
-    let outbox = {
-        let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-            "SELECT job_type, \
-                COUNT(*) FILTER (WHERE processed_at IS NULL), \
-                COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 hour'), \
-                COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 day') \
-             FROM job_outbox GROUP BY job_type ORDER BY job_type",
-        )
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+async fn fetch_outbox_stats(db: &PgPool) -> OutboxStats {
+    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT job_type, \
+            COUNT(*) FILTER (WHERE processed_at IS NULL), \
+            COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 hour'), \
+            COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 day') \
+         FROM job_outbox GROUP BY job_type ORDER BY job_type",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
 
-        let pending: i64 = rows.iter().map(|(_, p, _, _)| p).sum();
-        let processed_last_hour: i64 = rows.iter().map(|(_, _, p, _)| p).sum();
-        let processed_last_day: i64 = rows.iter().map(|(_, _, _, p)| p).sum();
+    let pending: i64 = rows.iter().map(|(_, p, _, _)| p).sum();
+    let processed_last_hour: i64 = rows.iter().map(|(_, _, p, _)| p).sum();
+    let processed_last_day: i64 = rows.iter().map(|(_, _, _, p)| p).sum();
 
-        let by_type = rows
-            .into_iter()
-            .map(|(job_type, p, plh, pld)| OutboxJobTypeStats {
-                job_type,
-                pending: p,
-                processed_last_hour: plh,
-                processed_last_day: pld,
-            })
-            .collect();
+    let by_type = rows
+        .into_iter()
+        .map(|(job_type, p, plh, pld)| OutboxJobTypeStats {
+            job_type,
+            pending: p,
+            processed_last_hour: plh,
+            processed_last_day: pld,
+        })
+        .collect();
 
-        OutboxStats {
-            by_type,
-            pending,
-            processed_last_hour,
-            processed_last_day,
-        }
-    };
+    OutboxStats {
+        by_type,
+        pending,
+        processed_last_hour,
+        processed_last_day,
+    }
+}
 
-    let active_jobs = state.job_tracker.active_jobs();
-
-    let articles: Vec<DictionarySyncStats> = sqlx::query_as::<_, (String, i64, i64, i64)>(
+async fn fetch_article_stats(db: &PgPool) -> Vec<DictionarySyncStats> {
+    sqlx::query_as::<_, (String, i64, i64, i64)>(
         "SELECT dictionary, \
             COUNT(*) FILTER (WHERE sync_status = 'idle'), \
             COUNT(*) FILTER (WHERE sync_status = 'pending_fetch'), \
             COUNT(*) FILTER (WHERE sync_status = 'pending_index') \
          FROM articles GROUP BY dictionary ORDER BY dictionary",
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .unwrap_or_default()
     .into_iter()
@@ -598,14 +687,71 @@ async fn get_stats(
             pending_index,
         },
     )
-    .collect();
+    .collect()
+}
 
-    Ok(Json(Stats {
-        queues,
-        outbox,
-        articles,
-        active_jobs,
-    }))
+async fn stats_ws(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    upgrade.on_upgrade(move |socket| stats_ws_handler(socket, state))
+}
+
+async fn stats_ws_handler(mut socket: ws::WebSocket, state: WebState) {
+    use tokio::time::{Duration, interval};
+
+    macro_rules! send {
+        ($socket:expr, $msg:expr) => {
+            if let Ok(json) = serde_json::to_string(&$msg) {
+                if $socket.send(ws::Message::text(json)).await.is_err() {
+                    return;
+                }
+            }
+        };
+    }
+
+    let mut fast_tick = interval(Duration::from_millis(500));
+    let mut slow_tick = interval(Duration::from_secs(3));
+
+    let mut conn = state.redis_conn.clone();
+    send!(
+        socket,
+        StatsMessage::Queues(fetch_queue_stats(&mut conn).await)
+    );
+    send!(
+        socket,
+        StatsMessage::ActiveJobs(state.job_tracker.active_jobs())
+    );
+    send!(
+        socket,
+        StatsMessage::Outbox(fetch_outbox_stats(&state.db).await)
+    );
+    send!(
+        socket,
+        StatsMessage::Articles(fetch_article_stats(&state.db).await)
+    );
+
+    fast_tick.reset();
+    slow_tick.reset();
+
+    loop {
+        tokio::select! {
+            _ = fast_tick.tick() => {
+                send!(socket, StatsMessage::Queues(fetch_queue_stats(&mut conn).await));
+                send!(socket, StatsMessage::ActiveJobs(state.job_tracker.active_jobs()));
+            }
+            _ = slow_tick.tick() => {
+                send!(socket, StatsMessage::Outbox(fetch_outbox_stats(&state.db).await));
+                send!(socket, StatsMessage::Articles(fetch_article_stats(&state.db).await));
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(ws::Message::Close(_))) | None => return,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -783,4 +929,20 @@ async fn trigger_sync(
         ok: true,
         message: format!("Synkronisering starta for: {dict_names:?}"),
     }))
+}
+
+async fn trigger_sweep(
+    axum::extract::State(state): axum::extract::State<WebState>,
+) -> Result<Json<ActionResult>, StatusCode> {
+    let mut storage = state.sweep_storage.clone();
+    match storage.push(super::jobs::SweepJob).await {
+        Ok(()) => Ok(Json(ActionResult {
+            ok: true,
+            message: "Opprydding lagd i kø.".to_string(),
+        })),
+        Err(e) => Ok(Json(ActionResult {
+            ok: false,
+            message: format!("Kunne ikkje starte opprydding: {e}"),
+        })),
+    }
 }
