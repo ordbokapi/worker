@@ -103,10 +103,11 @@ pub struct SettledSnapshotState {
 
 #[derive(Serialize)]
 struct SnapshotManifest {
+    manifest_version: u32,
     created_at: String,
     cursor: String,
-    postgres_key: String,
-    postgres_latest_key: String,
+    postgres_path: String,
+    latest_postgres_path: String,
     sha256: String,
     size_bytes: u64,
     worker_version: String,
@@ -274,10 +275,11 @@ impl SnapshotConfig {
         let latest_manifest_key = format!("{prefix}latest/manifest.json");
 
         let manifest = SnapshotManifest {
+            manifest_version: 1,
             created_at: Utc::now().to_rfc3339(),
             cursor: cursor.to_rfc3339(),
-            postgres_key: postgres_key.clone(),
-            postgres_latest_key: latest_postgres_key.clone(),
+            postgres_path: postgres_key.clone(),
+            latest_postgres_path: latest_postgres_key.clone(),
             sha256,
             size_bytes,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
