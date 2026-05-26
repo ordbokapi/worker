@@ -106,8 +106,6 @@ struct SnapshotManifest {
     manifest_version: u32,
     created_at: String,
     cursor: String,
-    postgres_path: String,
-    latest_postgres_path: String,
     sha256: String,
     size_bytes: u64,
     worker_version: String,
@@ -269,8 +267,8 @@ impl SnapshotConfig {
 
         let snapshot_id = cursor.format("%Y-%m-%dT%H-%M-%SZ").to_string();
         let prefix = normalized_prefix(&self.prefix);
-        let postgres_key = format!("{prefix}snapshots/{snapshot_id}/postgres.dump");
-        let manifest_key = format!("{prefix}snapshots/{snapshot_id}/manifest.json");
+        let postgres_key = format!("{prefix}{snapshot_id}/postgres.dump");
+        let manifest_key = format!("{prefix}{snapshot_id}/manifest.json");
         let latest_postgres_key = format!("{prefix}latest/postgres.dump");
         let latest_manifest_key = format!("{prefix}latest/manifest.json");
 
@@ -278,8 +276,6 @@ impl SnapshotConfig {
             manifest_version: 1,
             created_at: Utc::now().to_rfc3339(),
             cursor: cursor.to_rfc3339(),
-            postgres_path: postgres_key.clone(),
-            latest_postgres_path: latest_postgres_key.clone(),
             sha256,
             size_bytes,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -528,7 +524,7 @@ async fn prune_old_snapshots(
     prefix: &str,
     retention: usize,
 ) -> Result<()> {
-    let snapshot_prefix = format!("{prefix}snapshots/");
+    let snapshot_prefix = normalized_prefix(prefix);
     let response = client
         .list_objects_v2()
         .bucket(bucket)
@@ -542,6 +538,7 @@ async fn prune_old_snapshots(
         .filter_map(|obj| obj.key())
         .filter_map(|key| key.strip_prefix(&snapshot_prefix))
         .filter_map(|key| key.split('/').next())
+        .filter(|snapshot_id| *snapshot_id != "latest")
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>();
 
