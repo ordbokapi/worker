@@ -715,6 +715,7 @@ async fn handle_daily_sync(
         if let Err(e) = fal
             .push(FetchArticleListJob {
                 dictionary: d.as_str().to_string(),
+                force: false,
             })
             .await
         {

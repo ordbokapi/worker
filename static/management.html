@@ -26,72 +26,204 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
     <title>Ordbok-API-arbeidarprosessen</title>
     <style>
       :root {
-        --color-danger: #c33;
-        --color-muted: #999;
+        --bg: #ffffff;
+        --bg-surface: #f0f9fb;
+        --text: #1a2730;
+        --text-muted: #4a6670;
+        --primary: #0593ac;
+        --primary-hover: #047a90;
+        --border: #d0dfe4;
+        --border-subtle: #e4ecef;
+        --color-error: #d64545;
+        --color-success: #28a745;
+        --color-warning: #d29922;
         --color-warning-bg: #fff3cd;
-        --color-warning-border: #ffc107;
-        --color-toast-bg: #333;
-        --color-toast-fg: #fff;
+        --radius: 6px;
+        --font-mono: "IBM Plex Mono", "Menlo", "Consolas", monospace;
       }
 
       @media (prefers-color-scheme: dark) {
         :root {
-          --color-danger: #f66;
-          --color-muted: #888;
+          --bg: #0f1419;
+          --bg-surface: #1a2730;
+          --text: #e8edef;
+          --text-muted: #8ea3ad;
+          --primary: #4dcadc;
+          --primary-hover: #80d9e6;
+          --border: #2a3f4a;
+          --border-subtle: #1f3040;
+          --color-error: #f87171;
+          --color-success: #3fb950;
           --color-warning-bg: #3d2e00;
-          --color-warning-border: #a67c00;
-          --color-toast-bg: #ddd;
-          --color-toast-fg: #111;
+        }
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: var(--nav-height);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
         }
       }
 
       body {
         font-family: system-ui, sans-serif;
-        max-width: 80rem;
+        max-width: 72rem;
         margin: 0 auto;
         padding: 1.5rem;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+      }
+
+      strong {
+        font-weight: 600;
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 0.5rem;
+        line-height: 1.2;
+      }
+
+      h1 {
+        font-size: 1.4rem;
+      }
+
+      h2 {
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--text-muted);
+      }
+
+      button {
+        font: inherit;
+        font-size: 0.85rem;
+        border: 1px solid var(--border);
+        background: var(--bg-surface);
+        color: var(--text);
+        padding: 0.35rem 0.7rem;
+        border-radius: var(--radius);
+        cursor: pointer;
+        transition:
+          background 0.15s ease,
+          border-color 0.15s ease;
+      }
+
+      button:hover {
+        border-color: var(--primary);
+      }
+
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      button.primary {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: #fff;
+      }
+
+      button.primary:hover {
+        background: var(--primary-hover);
+        border-color: var(--primary-hover);
+      }
+
+      button.danger {
+        color: var(--color-error);
+        border-color: var(--color-error);
+        background: color-mix(in srgb, var(--color-error) 15%, var(--bg));
+      }
+
+      button.danger:hover {
+        background: var(--color-error);
+        color: #fff;
+      }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 0.88rem;
+      }
+
+      th,
+      td {
+        padding: 0.35rem 0.6rem;
+        text-align: left;
+      }
+
+      th {
+        color: var(--text-muted);
+        font-weight: 500;
+        font-size: 0.8rem;
+        border-bottom: 2px solid var(--border);
+      }
+
+      td {
+        border-bottom: 1px solid var(--border-subtle);
+      }
+
+      tr.total td {
+        border-top: 2px solid var(--border);
+        border-bottom: none;
+        font-weight: 600;
+      }
+
+      td.num,
+      th.num {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        font-size: 0.82rem;
       }
 
       td.num {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
+        font-family: var(--font-mono);
+      }
+
+      .zero {
+        color: var(--text-muted);
+        opacity: 0.5;
+      }
+
+      header {
+        display: flex;
+        align-items: baseline;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin-bottom: 1.5rem;
+      }
+
+      .meta {
+        display: flex;
+        gap: 0.75rem;
+        align-items: center;
+        font-size: 0.82rem;
+        flex-grow: 1;
       }
 
       .actions {
         display: flex;
-        gap: 0.5rem;
+        gap: 0.4rem;
         flex-wrap: wrap;
-      }
-
-      .danger {
-        color: var(--color-danger);
-      }
-
-      .outbox-stats {
-        display: grid;
-        grid-template-columns: auto auto;
-        gap: 0.2rem 1rem;
-        max-width: 20rem;
-      }
-
-      .toast {
-        position: fixed;
-        bottom: 1rem;
-        right: 1rem;
-        padding: 0.6rem 1rem;
-        background: var(--color-toast-bg);
-        color: var(--color-toast-fg);
-        opacity: 0;
-        transition: opacity 0.3s;
-      }
-
-      .toast.visible {
-        opacity: 1;
-      }
-
-      .toast.error {
-        background: var(--color-danger);
-        color: var(--color-toast-fg);
+        align-items: center;
       }
 
       .sync-controls {
@@ -99,12 +231,24 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         gap: 0.8rem;
         align-items: center;
         flex-wrap: wrap;
+        font-size: 0.88rem;
+      }
+
+      .sync-controls label {
+        cursor: pointer;
+      }
+
+      section {
+        margin-bottom: 1.5rem;
       }
 
       .warning {
         background: var(--color-warning-bg);
-        border: 1px solid var(--color-warning-border);
+        border: 1px solid var(--color-warning);
+        border-radius: var(--radius);
         padding: 0.5rem 0.8rem;
+        margin-bottom: 1rem;
+        font-size: 0.88rem;
       }
 
       .hidden {
@@ -112,66 +256,170 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       }
 
       .muted {
-        color: var(--color-muted);
+        color: var(--text-muted);
+      }
+
+      .danger-zone {
+        margin-bottom: 1.5rem;
+        border: 1px solid var(--color-error);
+        background: color-mix(in srgb, var(--color-error) 5%, var(--bg));
+        border-radius: var(--radius);
+        padding: 0.5rem 0.8rem;
+      }
+
+      .danger-zone summary {
+        cursor: pointer;
+        color: var(--color-error);
+        font-size: 0.85rem;
+        font-weight: 500;
+      }
+
+      .danger-zone .actions {
+        margin-top: 0.5rem;
+      }
+
+      .active-jobs {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+
+      .active-jobs li {
+        padding: 0.25rem 0;
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
+      }
+
+      .spacer {
+        flex-grow: 1;
+      }
+
+      .toast {
+        position: fixed;
+        bottom: 1rem;
+        right: 1rem;
+        padding: 0.6rem 1rem;
+        background: var(--bg-surface);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        font-size: 0.85rem;
+        opacity: 0;
+        transition: opacity 0.2s ease;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        .toast {
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+      }
+
+      .toast.visible {
+        opacity: 1;
+      }
+
+      .toast.error {
+        border-color: var(--color-error);
+        color: var(--color-error);
       }
     </style>
   </head>
   <body>
-    <h1>Ordbok-API-arbeidarprosessen</h1>
+    <header>
+      <h1>Status</h1>
+      <div class="meta">
+        <span id="status">Lastar…</span>
+        <span class="spacer"></span>
+        <span id="last-update" class="muted"></span>
+        <button id="btn-pause">⏸ Pause</button>
+        <form method="post" action="/api/logout" style="margin: 0">
+          <button type="submit">Logg ut</button>
+        </form>
+      </div>
+    </header>
+
     <div id="no-auth-warning" class="warning hidden">
-      ⚠️ MGMT_UI_SECRET_HASH er ikkje sett. Alle har tilgang. Set
-      miljøvariabelen for å krevja autentisering.
-    </div>
-    <div class="status" id="status">Lastar…</div>
-    <div id="last-update" class="muted"></div>
-
-    <div class="actions">
-      <button id="btn-clear-queues" class="danger">Tøm køar</button>
-      <button id="btn-clear-outbox" class="danger">Tøm utboks</button>
-      <button id="btn-clear-all" class="danger">Tøm alt</button>
-      <button id="btn-pause">⏸ Stopp automatisk oppdatering</button>
-      <form method="post" action="/api/logout" style="margin: 0">
-        <button type="submit">Logg ut</button>
-      </form>
+      ⚠️ MGMT_UI_SECRET_HASH er ikkje sett. Alle har tilgang.
     </div>
 
-    <h2>Synkronisering</h2>
-    <div class="sync-controls">
-      <label
-        ><input type="checkbox" name="dict" value="bm" checked /> Bokmålsordboka
-        (bm)</label
-      >
-      <label
-        ><input type="checkbox" name="dict" value="nn" checked /> Nynorskordboka
-        (nn)</label
-      >
-      <label
-        ><input type="checkbox" name="dict" value="no" checked /> Norsk Ordbok
-        (no)</label
-      >
-      <button id="btn-sync">Synkroniser</button>
-    </div>
+    <details class="danger-zone">
+      <summary>Farlege handlingar</summary>
+      <div class="actions">
+        <button id="btn-clear-queues" class="danger">Tøm køar</button>
+        <button id="btn-clear-outbox" class="danger">Tøm utboks</button>
+        <button id="btn-clear-all" class="danger">Tøm alt</button>
+      </div>
+    </details>
 
-    <h2>Køar</h2>
-    <table id="queue-table">
-      <thead>
-        <tr>
-          <th>Kø</th>
-          <th>På vent</th>
-          <th>Planlagde</th>
-          <th>Mislukka</th>
-          <th>Daude</th>
-          <th>Ferdige</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+    <section>
+      <h2>Artiklar</h2>
+      <table id="article-table">
+        <thead>
+          <tr>
+            <th>Ordbok</th>
+            <th class="num">Totalt</th>
+            <th class="num">Ledige</th>
+            <th class="num">Ventar på henting</th>
+            <th class="num">Ventar på indeksering</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="sync-controls" style="margin-top: 0.8rem">
+        <label
+          ><input type="checkbox" name="dict" value="bm" checked /> bm</label
+        >
+        <label
+          ><input type="checkbox" name="dict" value="nn" checked /> nn</label
+        >
+        <label
+          ><input type="checkbox" name="dict" value="no" checked /> no</label
+        >
+        <button id="btn-sync" class="primary">Synkroniser</button>
+        <label class="muted"
+          ><input type="checkbox" id="force-sync" /> Full
+          resynkronisering</label
+        >
+      </div>
+    </section>
 
-    <h2>Utboks</h2>
-    <dl class="outbox-stats" id="outbox-stats"></dl>
+    <section>
+      <h2>Frå utboks til køar</h2>
+      <table id="outbox-table">
+        <thead>
+          <tr>
+            <th>Oppgåvetype</th>
+            <th class="num">På vent</th>
+            <th class="num">Sendt (1t)</th>
+            <th class="num">Sendt (24t)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
 
-    <h2>Aktive oppgåver</h2>
-    <ul class="active-jobs" id="active-jobs"></ul>
+    <section>
+      <h2>Køar (Redis)</h2>
+      <table id="queue-table">
+        <thead>
+          <tr>
+            <th>Kø</th>
+            <th class="num">På vent</th>
+            <th class="num">Planlagde</th>
+            <th class="num">Mislukka</th>
+            <th class="num">Daude</th>
+            <th class="num">Ferdige</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>I gang</h2>
+      <ul class="active-jobs" id="active-jobs"></ul>
+    </section>
 
     <div class="toast" id="toast"></div>
 
@@ -180,7 +428,8 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       const statusElement = document.querySelector("#status");
       const lastUpdateElement = document.querySelector("#last-update");
       const queueBody = document.querySelector("#queue-table tbody");
-      const outboxElement = document.querySelector("#outbox-stats");
+      const outboxBody = document.querySelector("#outbox-table tbody");
+      const articleBody = document.querySelector("#article-table tbody");
       const activeElement = document.querySelector("#active-jobs");
       const toastElement = document.querySelector("#toast");
 
@@ -197,12 +446,37 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         }
       }
 
-      const escapeTemplate = document.createElement("template");
+      function num(n) {
+        return n.toLocaleString("nn");
+      }
 
-      function esc(str) {
-        escapeTemplate.content.textContent = String(str);
+      function setCell(td, value, isNum = false) {
+        const text = isNum ? num(value) : String(value);
 
-        return escapeTemplate.innerHTML;
+        if (td.textContent !== text) {
+          td.textContent = text;
+        }
+
+        if (isNum) {
+          td.classList.toggle("zero", value === 0);
+        }
+      }
+
+      function ensureRows(tbody, count, colCount) {
+        while (tbody.rows.length > count) {
+          tbody.deleteRow(tbody.rows.length - 1);
+        }
+
+        while (tbody.rows.length < count) {
+          const row = tbody.insertRow();
+          for (let i = 0; i < colCount; i++) {
+            const td = row.insertCell();
+
+            if (i > 0) {
+              td.className = "num";
+            }
+          }
+        }
       }
 
       function showToast(msg, isError = false) {
@@ -213,6 +487,24 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
         setTimeout(() => toastElement.classList.remove("visible"), 3000);
       }
+
+      const jobTypeOrder = [
+        "fetch_article",
+        "index_article",
+        "batch_index",
+        "fetch_bibliography",
+        "fetch_place",
+        "resolve_inline_code",
+      ];
+
+      const jobTypeLabels = {
+        fetch_article: "Hent artikkel",
+        index_article: "Indekser artikkel",
+        batch_index: "Batchindeksering",
+        fetch_bibliography: "Hent bibliografi",
+        fetch_place: "Hent stad",
+        resolve_inline_code: "Løys innebygd kode",
+      };
 
       async function fetchStats() {
         try {
@@ -232,40 +524,111 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           render(data);
 
           statusElement.textContent = "Tilkopla";
-          statusElement.classList.remove("danger");
+          statusElement.style.color = "var(--color-success)";
 
-          lastUpdateElement.textContent = `Sist oppdatert: ${new Date().toLocaleTimeString()}`;
+          lastUpdateElement.textContent = new Date().toLocaleTimeString();
         } catch (e) {
-          statusElement.textContent = `Feil: ${e.message}`;
-          statusElement.classList.add("danger");
+          statusElement.textContent = "Fråkopla";
+          statusElement.style.color = "var(--color-error)";
+          lastUpdateElement.textContent = e.message;
         }
       }
 
-      function render({ queues, outbox, active_jobs }) {
-        queueBody.innerHTML = queues
-          .map(
-            (q) => `<tr>
-              <td>${esc(q.namespace.replace("apalis:", ""))}</td>
-              <td class="num">${esc(q.pending)}</td>
-              <td class="num">${esc(q.scheduled)}</td>
-              <td class="num">${esc(q.failed)}</td>
-              <td class="num">${esc(q.dead)}</td>
-              <td class="num">${esc(q.done)}</td>
-            </tr>`,
-          )
-          .join("");
+      function render({ queues, outbox, articles, active_jobs }) {
+        ensureRows(articleBody, articles.length, 5);
+        articles.forEach((a, i) => {
+          const row = articleBody.rows[i];
 
-        outboxElement.innerHTML = `
-          <dt>På vent</dt><dd>${esc(outbox.pending)}</dd>
-          <dt>Ferdige (1t)</dt><dd>${esc(outbox.processed_last_hour)}</dd>
-          <dt>Total</dt><dd>${esc(outbox.total)}</dd>`;
+          setCell(row.cells[0], a.dictionary);
+          setCell(
+            row.cells[1],
+            a.idle + a.pending_fetch + a.pending_index,
+            true,
+          );
+          setCell(row.cells[2], a.idle, true);
+          setCell(row.cells[3], a.pending_fetch, true);
+          setCell(row.cells[4], a.pending_index, true);
+        });
+
+        const outboxMap = Object.fromEntries(
+          outbox.by_type.map((o) => [o.job_type, o]),
+        );
+        const outboxRowCount = jobTypeOrder.length + 1; // +1 for totals
+        ensureRows(outboxBody, outboxRowCount, 4);
+        jobTypeOrder.forEach((type, i) => {
+          const o = outboxMap[type] || {
+            pending: 0,
+            processed_last_hour: 0,
+            processed_last_day: 0,
+          };
+          const row = outboxBody.rows[i];
+
+          setCell(row.cells[0], jobTypeLabels[type] || type);
+          setCell(row.cells[1], o.pending, true);
+          setCell(row.cells[2], o.processed_last_hour, true);
+          setCell(row.cells[3], o.processed_last_day, true);
+        });
+        const totalRow = outboxBody.rows[jobTypeOrder.length];
+
+        totalRow.className = "total";
+
+        setCell(totalRow.cells[0], "Totalt");
+        setCell(totalRow.cells[1], outbox.pending, true);
+        setCell(totalRow.cells[2], outbox.processed_last_hour, true);
+        setCell(totalRow.cells[3], outbox.processed_last_day, true);
+
+        ensureRows(queueBody, queues.length, 6);
+        queues.forEach((q, i) => {
+          const row = queueBody.rows[i];
+
+          setCell(row.cells[0], q.namespace.replace("apalis:", ""));
+          setCell(row.cells[1], q.pending, true);
+          setCell(row.cells[2], q.scheduled, true);
+          setCell(row.cells[3], q.failed, true);
+          setCell(row.cells[4], q.dead, true);
+          setCell(row.cells[5], q.done, true);
+        });
 
         if (active_jobs.length === 0) {
-          activeElement.innerHTML = '<li class="muted">Ingen</li>';
+          if (
+            activeElement.children.length !== 1 ||
+            activeElement.children[0].tagName !== "LI"
+          ) {
+            activeElement.innerHTML = "";
+
+            const li = document.createElement("li");
+
+            li.className = "muted";
+            li.textContent = "Ingen";
+
+            activeElement.appendChild(li);
+          } else {
+            const li = activeElement.children[0];
+
+            if (li.textContent !== "Ingen") {
+              li.textContent = "Ingen";
+            }
+
+            li.className = "muted";
+          }
         } else {
-          activeElement.innerHTML = active_jobs
-            .map((j) => `<li>${esc(j)}</li>`)
-            .join("");
+          while (activeElement.children.length > active_jobs.length) {
+            activeElement.removeChild(activeElement.lastChild);
+          }
+
+          while (activeElement.children.length < active_jobs.length) {
+            activeElement.appendChild(document.createElement("li"));
+          }
+
+          active_jobs.forEach((job, i) => {
+            const li = activeElement.children[i];
+
+            if (li.textContent !== job) {
+              li.textContent = job;
+            }
+
+            li.className = "";
+          });
         }
       }
 
@@ -281,10 +644,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           const data = await res.json();
 
           showToast(data.message, !data.ok);
-
-          if (!paused) {
-            fetchStats();
-          }
+          fetchStats();
         } catch (e) {
           showToast(`Feil: ${e.message}`, true);
         } finally {
@@ -321,7 +681,13 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             return;
           }
 
-          if (!confirm(`Synkronisere ${checked.join(", ")}?`)) {
+          const force = document.querySelector("#force-sync").checked;
+
+          if (
+            !confirm(
+              `Synkronisere ${checked.join(", ")}${force ? " (full)" : ""}?`,
+            )
+          ) {
             return;
           }
 
@@ -331,15 +697,12 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             const res = await fetch("/api/sync", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ dictionaries: checked }),
+              body: JSON.stringify({ dictionaries: checked, force }),
             });
             const data = await res.json();
 
             showToast(data.message, !data.ok);
-
-            if (!paused) {
-              fetchStats();
-            }
+            fetchStats();
           } catch (err) {
             showToast(`Feil: ${err.message}`, true);
           } finally {
@@ -349,9 +712,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       document.querySelector("#btn-pause").addEventListener("click", (e) => {
         paused = !paused;
-        e.currentTarget.textContent = paused
-          ? "▶ Oppdater automatisk"
-          : "⏸ Stopp automatisk oppdatering";
+        e.currentTarget.textContent = paused ? "▶ Hald fram" : "⏸ Pause";
 
         if (paused) {
           clearInterval(timer);

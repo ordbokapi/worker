@@ -78,6 +78,10 @@ impl SyncService {
         let dict = UibDictionary::parse(&job.dictionary)
             .ok_or_else(|| anyhow!("Unknown dictionary: {}", job.dictionary))?;
 
+        if job.force {
+            info!("[{dict}] Full resync requested.");
+        }
+
         info!("[{dict}] Fetching article list from UiB API…");
         let article_list = self.http.fetch_article_list(dict).await?;
         info!(
@@ -105,12 +109,15 @@ impl SyncService {
             new_id_set.insert(meta.article_id);
 
             if let Some(existing) = existing_metadata_map.get(&meta.article_id) {
-                if existing.sync_status != SyncStatus::Idle {
-                    continue;
-                }
+                if !job.force {
+                    if existing.sync_status != SyncStatus::Idle {
+                        continue;
+                    }
 
-                if existing.revision == meta.revision && existing.updated_at == meta.updated_at {
-                    continue;
+                    if existing.revision == meta.revision && existing.updated_at == meta.updated_at
+                    {
+                        continue;
+                    }
                 }
 
                 debug!(
@@ -649,6 +656,7 @@ impl SyncService {
                     storage
                         .push(FetchArticleListJob {
                             dictionary: dict_str.to_string(),
+                            force: false,
                         })
                         .await
                         .map_err(|e| anyhow!("Failed to enqueue: {e}"))?;
@@ -829,22 +837,14 @@ impl SyncService {
         fetch_article_list_storage: &RedisStorage<FetchArticleListJob>,
         fetch_dict_metadata_storage: &RedisStorage<FetchDictionaryMetadataJob>,
     ) -> Result<()> {
-        // Reset all articles for these dictionaries to pending_fetch.
         for dict in dictionaries {
-            info!("[{dict}] Resetting articles to pending_fetch for resync…");
-
-            sqlx::query(
-                "UPDATE articles SET sync_status = 'pending_fetch', status_changed_at = now()
-                 WHERE dictionary = $1",
-            )
-            .bind(dict.as_str())
-            .execute(&self.db)
-            .await?;
+            info!("[{dict}] Enqueuing full resync…");
 
             let mut storage = fetch_article_list_storage.clone();
             storage
                 .push(FetchArticleListJob {
                     dictionary: dict.as_str().to_string(),
+                    force: true,
                 })
                 .await
                 .map_err(|e| anyhow!("Failed to enqueue: {e}"))?;

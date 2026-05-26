@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchArticleListJob {
     pub dictionary: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 impl FetchArticleListJob {

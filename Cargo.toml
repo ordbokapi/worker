@@ -59,6 +59,7 @@ default = []
 use_dotenv = ["dotenvy"]
 matrix_notifs = ["matrix-sdk"]
 sentry_integration = ["sentry"]
+dev_ui = []
 dotenvy = ["dep:dotenvy"]
 
 [profile.dev]

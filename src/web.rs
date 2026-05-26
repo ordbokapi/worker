@@ -99,7 +99,8 @@ pub async fn routes(state: WebState) -> Router {
         .route("/api/sync", post(trigger_sync))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .route("/", get(serve_ui))
         .route("/login", get(serve_login))
         .route("/api/auth-status", get(auth_status))
@@ -108,7 +109,30 @@ pub async fn routes(state: WebState) -> Router {
         .merge(authed)
         .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn(security_headers))
-        .with_state(state)
+        .with_state(state);
+
+    #[cfg(feature = "dev_ui")]
+    {
+        app = app.route("/static/{*path}", get(serve_static_file));
+    }
+
+    app
+}
+
+#[cfg(feature = "dev_ui")]
+async fn serve_static_file(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let file_path = std::path::Path::new("static").join(&path);
+    std::fs::read_to_string(&file_path).map_or_else(
+        |_| StatusCode::NOT_FOUND.into_response(),
+        |content| {
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let content_type = match ext {
+                "js" => "application/javascript",
+                _ => "text/plain",
+            };
+            ([(header::CONTENT_TYPE, content_type)], content).into_response()
+        },
+    )
 }
 
 async fn fetch_proxy_list_urls() -> Vec<ipnet::IpNet> {
@@ -214,6 +238,15 @@ async fn security_headers(req: Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    #[cfg(feature = "dev_ui")]
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    #[cfg(not(feature = "dev_ui"))]
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
@@ -346,6 +379,28 @@ async fn login(
     ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
 }
 
+#[cfg(feature = "dev_ui")]
+fn serve_static(filename: &str) -> String {
+    let path = std::path::Path::new("static").join(filename);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return format!("<pre>Failed to read {}: {e}</pre>", path.display()),
+    };
+    content.replace(
+        "</body>",
+        "<script src=\"/static/dev-reload.js\"></script></body>",
+    )
+}
+
+#[cfg(not(feature = "dev_ui"))]
+fn serve_static(filename: &str) -> &'static str {
+    match filename {
+        "management.html" => include_str!("../static/management.html"),
+        "login.html" => include_str!("../static/login.html"),
+        _ => "<pre>Unknown file</pre>",
+    }
+}
+
 async fn serve_ui(
     axum::extract::State(state): axum::extract::State<WebState>,
     req: Request,
@@ -361,7 +416,7 @@ async fn serve_ui(
 
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(include_str!("../static/management.html")),
+        Html(serve_static("management.html")),
     )
         .into_response()
 }
@@ -381,7 +436,7 @@ async fn serve_login(
 
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(include_str!("../static/login.html")),
+        Html(serve_static("login.html")),
     )
         .into_response()
 }
@@ -414,16 +469,34 @@ struct QueueStats {
 }
 
 #[derive(Serialize)]
-struct OutboxStats {
+struct OutboxJobTypeStats {
+    job_type: String,
     pending: i64,
     processed_last_hour: i64,
-    total: i64,
+    processed_last_day: i64,
+}
+
+#[derive(Serialize)]
+struct OutboxStats {
+    by_type: Vec<OutboxJobTypeStats>,
+    pending: i64,
+    processed_last_hour: i64,
+    processed_last_day: i64,
+}
+
+#[derive(Serialize)]
+struct DictionarySyncStats {
+    dictionary: String,
+    idle: i64,
+    pending_fetch: i64,
+    pending_index: i64,
 }
 
 #[derive(Serialize)]
 struct Stats {
     queues: Vec<QueueStats>,
     outbox: OutboxStats,
+    articles: Vec<DictionarySyncStats>,
     active_jobs: Vec<String>,
 }
 
@@ -470,33 +543,67 @@ async fn get_stats(
         });
     }
 
-    let outbox = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT \
-            COUNT(*) FILTER (WHERE processed_at IS NULL), \
-            COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 hour'), \
-            COUNT(*) \
-         FROM job_outbox",
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_or(
+    let outbox = {
+        let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT job_type, \
+                COUNT(*) FILTER (WHERE processed_at IS NULL), \
+                COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 hour'), \
+                COUNT(*) FILTER (WHERE processed_at > NOW() - INTERVAL '1 day') \
+             FROM job_outbox GROUP BY job_type ORDER BY job_type",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        let pending: i64 = rows.iter().map(|(_, p, _, _)| p).sum();
+        let processed_last_hour: i64 = rows.iter().map(|(_, _, p, _)| p).sum();
+        let processed_last_day: i64 = rows.iter().map(|(_, _, _, p)| p).sum();
+
+        let by_type = rows
+            .into_iter()
+            .map(|(job_type, p, plh, pld)| OutboxJobTypeStats {
+                job_type,
+                pending: p,
+                processed_last_hour: plh,
+                processed_last_day: pld,
+            })
+            .collect();
+
         OutboxStats {
-            pending: 0,
-            processed_last_hour: 0,
-            total: 0,
-        },
-        |(pending, processed_last_hour, total)| OutboxStats {
+            by_type,
             pending,
             processed_last_hour,
-            total,
-        },
-    );
+            processed_last_day,
+        }
+    };
 
     let active_jobs = state.job_tracker.active_jobs();
+
+    let articles: Vec<DictionarySyncStats> = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        "SELECT dictionary, \
+            COUNT(*) FILTER (WHERE sync_status = 'idle'), \
+            COUNT(*) FILTER (WHERE sync_status = 'pending_fetch'), \
+            COUNT(*) FILTER (WHERE sync_status = 'pending_index') \
+         FROM articles GROUP BY dictionary ORDER BY dictionary",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(
+        |(dictionary, idle, pending_fetch, pending_index)| DictionarySyncStats {
+            dictionary,
+            idle,
+            pending_fetch,
+            pending_index,
+        },
+    )
+    .collect();
 
     Ok(Json(Stats {
         queues,
         outbox,
+        articles,
         active_jobs,
     }))
 }
@@ -505,6 +612,22 @@ async fn get_stats(
 struct ActionResult {
     ok: bool,
     message: String,
+}
+
+async fn reset_orphaned_articles(db: &sqlx::PgPool) -> String {
+    match sqlx::query(
+        "UPDATE articles SET sync_status = 'idle', status_changed_at = now() \
+         WHERE sync_status != 'idle'",
+    )
+    .execute(db)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            format!("Nullstilte {} foreldrelause artiklar.", r.rows_affected())
+        }
+        Ok(_) => String::new(),
+        Err(e) => format!("Nullstilling feila: {e}"),
+    }
 }
 
 async fn clear_queues(
@@ -523,9 +646,11 @@ async fn clear_queues(
             .unwrap_or(());
     }
 
+    let reset = reset_orphaned_articles(&state.db).await;
+
     Ok(Json(ActionResult {
         ok: true,
-        message: "All queues cleared.".into(),
+        message: format!("Alle køar tømde. {reset}"),
     }))
 }
 
@@ -536,14 +661,19 @@ async fn clear_outbox(
         .execute(&state.db)
         .await;
 
+    let reset = reset_orphaned_articles(&state.db).await;
+
     match result {
         Ok(r) => Ok(Json(ActionResult {
             ok: true,
-            message: format!("Deleted {} pending outbox entries.", r.rows_affected()),
+            message: format!(
+                "Sletta {} ventande utboksoppføringar. {reset}",
+                r.rows_affected()
+            ),
         })),
         Err(e) => Ok(Json(ActionResult {
             ok: false,
-            message: format!("Failed to clear outbox: {e}"),
+            message: format!("Kunne ikkje tømme utboks: {e}"),
         })),
     }
 }
@@ -569,13 +699,15 @@ async fn clear_all(
         .await;
 
     let outbox_msg = match outbox_result {
-        Ok(r) => format!("Deleted {} pending outbox entries.", r.rows_affected()),
-        Err(e) => format!("Outbox clear failed: {e}"),
+        Ok(r) => format!("Sletta {} ventande utboksoppføringar.", r.rows_affected()),
+        Err(e) => format!("Utbokstømming feila: {e}"),
     };
+
+    let reset = reset_orphaned_articles(&state.db).await;
 
     Ok(Json(ActionResult {
         ok: true,
-        message: format!("Queues cleared. {outbox_msg}"),
+        message: format!("Køar tømde. {outbox_msg} {reset}"),
     }))
 }
 
@@ -583,6 +715,8 @@ async fn clear_all(
 struct SyncRequest {
     #[serde(default)]
     dictionaries: Vec<String>,
+    #[serde(default)]
+    force: bool,
 }
 
 async fn trigger_sync(
@@ -599,7 +733,7 @@ async fn trigger_sync(
                 None => {
                     return Ok(Json(ActionResult {
                         ok: false,
-                        message: format!("Unknown dictionary: {s}. Valid: bm, nn, no"),
+                        message: format!("Ukjend ordbok: {s}. Gyldige: bm, nn, no"),
                     }));
                 }
             }
@@ -611,30 +745,20 @@ async fn trigger_sync(
     info!("Triggering sync for: {dict_names:?}");
 
     for dict in &dicts {
-        if let Err(e) = sqlx::query(
-            "UPDATE articles SET sync_status = 'pending_fetch', status_changed_at = now()
-             WHERE dictionary = $1",
-        )
-        .bind(dict.as_str())
-        .execute(&state.db)
-        .await
-        {
-            return Ok(Json(ActionResult {
-                ok: false,
-                message: format!("DB error resetting {}: {e}", dict.as_str()),
-            }));
-        }
-
         let mut fal = state.fetch_article_list_storage.clone();
         if let Err(e) = fal
             .push(FetchArticleListJob {
                 dictionary: dict.as_str().to_string(),
+                force: body.force,
             })
             .await
         {
             return Ok(Json(ActionResult {
                 ok: false,
-                message: format!("Failed to enqueue article-list for {}: {e}", dict.as_str()),
+                message: format!(
+                    "Kunne ikkje leggje til artikkelliste for {}: {e}",
+                    dict.as_str()
+                ),
             }));
         }
 
@@ -647,13 +771,16 @@ async fn trigger_sync(
         {
             return Ok(Json(ActionResult {
                 ok: false,
-                message: format!("Failed to enqueue dict-metadata for {}: {e}", dict.as_str()),
+                message: format!(
+                    "Kunne ikkje leggje til ordbokmetadata for {}: {e}",
+                    dict.as_str()
+                ),
             }));
         }
     }
 
     Ok(Json(ActionResult {
         ok: true,
-        message: format!("Sync triggered for: {dict_names:?}"),
+        message: format!("Synkronisering starta for: {dict_names:?}"),
     }))
 }
