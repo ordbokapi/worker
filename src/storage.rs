@@ -18,7 +18,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use std::collections::{HashMap, HashSet};
 
 use crate::extraction::{ArticleAnalysis, ConceptMap, InlineRef};
@@ -84,7 +84,10 @@ async fn ensure_entity_pending_fetch(db: &PgPool, table: &str, entity_id: i64) -
             OR ({table}.sync_status = 'not_found'
                 AND {table}.status_changed_at < now() - interval '24 hours')"
     );
-    let result = sqlx::query(&query).bind(entity_id).execute(db).await?;
+    let result = sqlx::query(AssertSqlSafe(query))
+        .bind(entity_id)
+        .execute(db)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -103,7 +106,10 @@ pub async fn mark_entity_not_found(db: &PgPool, table: &str, id: i64) -> Result<
     let query = format!(
         "UPDATE {table} SET sync_status = 'not_found', status_changed_at = now() WHERE id = $1"
     );
-    sqlx::query(&query).bind(id).execute(db).await?;
+    sqlx::query(AssertSqlSafe(query))
+        .bind(id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -383,7 +389,10 @@ async fn mark_articles_for_reindex(
            AND j.{entity_column} = $1 AND a.sync_status = 'idle'
          RETURNING a.dictionary, a.id"
     );
-    let rows: Vec<(String, i64)> = sqlx::query_as(&query).bind(entity_id).fetch_all(db).await?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(query))
+        .bind(entity_id)
+        .fetch_all(db)
+        .await?;
     Ok(rows)
 }
 

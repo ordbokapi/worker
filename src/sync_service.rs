@@ -23,7 +23,7 @@ use apalis_redis::{ConnectionManager, RedisConfig, RedisStorage};
 use futures::StreamExt;
 use meilisearch_sdk::client::Client as MeiliClient;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, SqlSafeStr};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -776,7 +776,7 @@ impl SyncService {
     /// Query for unfetched entity IDs.
     async fn fetch_unfetched_entity_ids(
         &self,
-        query: &str,
+        query: impl SqlSafeStr,
         entity_name: &str,
     ) -> Result<Option<Vec<i64>>> {
         if !self.http.has_clarino_key() {
