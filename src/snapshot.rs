@@ -42,6 +42,7 @@ const SETTLED_CURSOR_KEY: &str = "snapshot_settled_cursor";
 const SETTLED_SINCE_KEY: &str = "snapshot_settled_since";
 const SNAPSHOT_PUBLISH_LOCK_KEY: i64 = 6_532_612_785_587_035_142;
 pub const POLL_SCHEDULE: &str = "0 */5 * * * *";
+const SNAPSHOT_EXCLUDE_TABLE_DATA: &[&str] = &["job_outbox"];
 
 struct SnapshotPublishLock {
     conn: PgConnection,
@@ -453,13 +454,19 @@ async fn redis_counts(redis_conn: &ConnectionManager) -> Result<(i64, i64)> {
 }
 
 fn create_pg_dump(pg_dump_bin: &str, database_url: &str, dump_path: &Path) -> Result<()> {
-    let status = Command::new(pg_dump_bin)
-        .arg("--format=custom")
+    let mut cmd = Command::new(pg_dump_bin);
+    cmd.arg("--format=custom")
         .arg("--compress=9")
         .arg("--no-owner")
         .arg("--no-privileges")
         .arg("--file")
-        .arg(dump_path)
+        .arg(dump_path);
+
+    for table in SNAPSHOT_EXCLUDE_TABLE_DATA {
+        cmd.arg("--exclude-table-data").arg(table);
+    }
+
+    let status = cmd
         .arg(database_url)
         .status()
         .with_context(|| format!("Failed to execute {pg_dump_bin}"))?;
