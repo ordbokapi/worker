@@ -65,5 +65,5 @@ run() {
 }
 
 # shellcheck disable=SC2086
-run cargo clippy $features_arg -- -D clippy::suspicious -D clippy::style -D clippy::complexity -D clippy::perf -D clippy::dbg_macro -D clippy::todo -D clippy::unimplemented -D warnings
+run cargo clippy $features_arg -- -D clippy::all -D clippy::pedantic -D clippy::nursery -A clippy::missing_errors_doc -A clippy::missing_panics_doc -A clippy::doc_markdown -A clippy::module_name_repetitions -D warnings
 run cargo fmt -- --check

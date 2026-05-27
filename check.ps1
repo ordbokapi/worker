@@ -63,7 +63,7 @@ if ($featuresArg) {
     $cmd += " $featuresArg"
 }
 
-$cmd += " -- -D clippy::suspicious -D clippy::style -D clippy::complexity -D clippy::perf -D clippy::dbg_macro -D clippy::todo -D clippy::unimplemented -D warnings"
+$cmd += " -- -D clippy::all -D clippy::pedantic -D clippy::nursery -A clippy::missing_errors_doc -A clippy::missing_panics_doc -A clippy::doc_markdown -A clippy::module_name_repetitions -D warnings"
 
 Run $cmd
 Run "cargo fmt -- --check"
