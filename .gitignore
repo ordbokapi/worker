@@ -17,6 +17,7 @@
 # along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
 /target
+.bootstrap*
 .meilidata*
 .pgdata*
 .valkey*

@@ -28,9 +28,22 @@ Arbeidarprosessen for å synkronisere dataa frå UiB med databasen til Ordbok AP
 
 1. Last ned og installer [Rust](https://www.rust-lang.org/tools/install).
 2. Last ned og installer [Docker](https://docs.docker.com/get-docker/).
-3. Opprett `.env`: `cp template.env .env`. Standardverdiane fungerer saman med `docker-compose.yml` utan endringar. Har du alt sett opp [API-kodelageret](https://github.com/ordbokapi/api) med same standardverdiar, deler dei same Docker-tenestene automatisk.
-4. Køyr `docker compose up -d` for å starte lokale tenester (PostgreSQL, MeiliSearch, Valkey). Dersom du alt har starta tenestene frå API-kodelageret, kan du hoppe over dette steget.
-5. Køyr `./run.sh` eller `.\run.ps1` for å byggje og køyre arbeidarprosessen med alle funksjonar. Du kan ogso køyre `cargo run --features use_dotenv` for å køyre med berre grunnfunksjonane (utan [Matrix](https://matrix.org/)-varsel o.l.).
+3. Opprett `.env`: `cp template.env .env`. Standardverdiane fungerer saman med `docker-compose.yml` utan endringar.
+
+> [!NOTE]
+> Har du alt starta tenestene i API-kodelageret, må du stoppe dei før du køyrer dette steget. Du kan kopiere `.meilidata`, `.pgdata` og `.valkey` frå API-kodelageret til dette kodelageret for å unngå å måtte synkronisere på nytt.
+>
+> Vil du bruke tenestene i dette kodelageret med API-et, kontroller at du har same verdiane for port og slikt i `.env` i begge kodelagera.
+
+4. Køyr `docker compose up bootstrap` for å fylle databasen med siste dagleg snapshot frå Ordbok API. Dette tek somme minutt. Du kan sjå framdrifta i loggane.
+
+> [!IMPORTANT]
+> **Det er svært tilrådd å køyre bootstrap** før du startar arbeidarprosessen, for å unngå at han må synkronisere alt frå starten av, som kan taka veldig lang tid og rammar tenestene til UiB med mange førespurnader.
+>
+> Dette vert òg gjort automatisk når ein køyrer `docker compose up -d` for fyrste gong, men då får ein ikkje sjå loggane.
+
+5. Køyr `docker compose up -d` for å starte lokale tenester (PostgreSQL, MeiliSearch, Valkey).
+6. Køyr `./run.sh` eller `.\run.ps1` for å byggje og køyre arbeidarprosessen med alle funksjonar. Du kan ogso køyre `cargo run --features use_dotenv` for å køyre med berre grunnfunksjonane (utan [Matrix](https://matrix.org/)-varsel o.l.).
 
 ### Skript
 
