@@ -190,10 +190,10 @@ async fn main() -> Result<()> {
     #[cfg(feature = "matrix_notifs")]
     let mut matrix_service_opt: Option<matrix_notify_service::MatrixNotifyService> = None;
 
-    if let Err(err) = run(
+    if let Err(err) = Box::pin(run(
         #[cfg(feature = "matrix_notifs")]
         &mut matrix_service_opt,
-    )
+    ))
     .await
     {
         error!("Application error: {err}");
