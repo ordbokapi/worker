@@ -19,6 +19,7 @@
 *
 !src
 !static
+!docker-scripts
 !build.rs
 !migrations
 !Cargo.toml

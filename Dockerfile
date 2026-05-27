@@ -60,7 +60,7 @@ RUN apt-get update \
 	&& . /etc/os-release \
 	&& echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
 	&& apt-get update \
-	&& apt-get install -y --no-install-recommends postgresql-client-18 \
+	&& apt-get install -y --no-install-recommends postgresql-client-18 jq \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& update-ca-certificates
 
@@ -68,6 +68,7 @@ ENV PG_DUMP_BIN=/usr/lib/postgresql/18/bin/pg_dump
 
 # Copy the binary from the builder
 COPY --from=builder /usr/src/ordbokapi-worker/target/release/ordbokapi-worker /usr/local/bin/ordbokapi-worker
+COPY --from=builder /usr/src/ordbokapi-worker/docker-scripts/bootstrap.sh /usr/local/bin/ordbokapi-bootstrap
 
 EXPOSE 3001
 
