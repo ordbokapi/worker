@@ -33,6 +33,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::jobs::{FetchArticleListJob, FetchDictionaryMetadataJob, QUEUE_NAMESPACES};
+use crate::snapshot::SnapshotConfig;
 use crate::state::UibDictionary;
 
 pub use apalis_redis::{ConnectionManager, RedisStorage};
@@ -59,6 +60,7 @@ pub struct WebState {
     pub sweep_storage: RedisStorage<super::jobs::SweepJob>,
     pub fetch_article_list_storage: RedisStorage<FetchArticleListJob>,
     pub fetch_dict_metadata_storage: RedisStorage<FetchDictionaryMetadataJob>,
+    pub snapshot_config: Option<SnapshotConfig>,
     pub secret_hash: Option<String>,
     pub session_key: [u8; 32],
     #[cfg(feature = "dev_ui")]
@@ -107,7 +109,6 @@ pub async fn routes(state: WebState) -> Router {
     let mut app = Router::new()
         .route("/", get(serve_ui))
         .route("/login", get(serve_login))
-        .route("/api/auth-status", get(auth_status))
         .route("/api/logout", post(logout))
         .merge(login_route)
         .merge(authed);
@@ -392,19 +393,6 @@ async fn require_auth(
     }
 }
 
-#[derive(Serialize)]
-struct AuthStatus {
-    auth_required: bool,
-}
-
-async fn auth_status(
-    axum::extract::State(state): axum::extract::State<WebState>,
-) -> Json<AuthStatus> {
-    Json(AuthStatus {
-        auth_required: state.secret_hash.is_some(),
-    })
-}
-
 #[derive(Deserialize)]
 struct LoginRequest {
     secret: String,
@@ -478,6 +466,8 @@ async fn serve_ui(
     let config_json = serde_json::json!({
         "dictionaries": dictionaries,
         "queueNamespaces": queues,
+        "snapshotsEnabled": state.snapshot_config.is_some(),
+        "authRequired": state.secret_hash.is_some(),
     });
     let config_script = format!("<script>window.__CONFIG__={config_json};</script>");
     let html =
@@ -494,13 +484,15 @@ async fn serve_login(
     axum::extract::State(state): axum::extract::State<WebState>,
     req: Request,
 ) -> Response {
-    if state.secret_hash.is_some() {
-        let authorized = extract_cookie(req.headers(), "mgmt_session")
-            .is_some_and(|token| verify_session_token(token, &state.session_key));
+    if state.secret_hash.is_none() {
+        return Redirect::to("/").into_response();
+    }
 
-        if authorized {
-            return Redirect::to("/").into_response();
-        }
+    let authorized = extract_cookie(req.headers(), "mgmt_session")
+        .is_some_and(|token| verify_session_token(token, &state.session_key));
+
+    if authorized {
+        return Redirect::to("/").into_response();
     }
 
     (
@@ -563,6 +555,14 @@ struct DictionarySyncStats {
 }
 
 #[derive(Serialize)]
+struct SnapshotStats {
+    enabled: bool,
+    last_published_cursor: Option<String>,
+    settled_since: Option<String>,
+    status: String,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type", content = "data")]
 enum StatsMessage {
     #[serde(rename = "queues")]
@@ -573,6 +573,8 @@ enum StatsMessage {
     Outbox(OutboxStats),
     #[serde(rename = "articles")]
     Articles(Vec<DictionarySyncStats>),
+    #[serde(rename = "snapshot")]
+    Snapshot(SnapshotStats),
 }
 
 async fn fetch_queue_stats(conn: &mut ConnectionManager) -> Vec<QueueStats> {
@@ -690,6 +692,40 @@ async fn fetch_article_stats(db: &PgPool) -> Vec<DictionarySyncStats> {
     .collect()
 }
 
+async fn fetch_snapshot_stats(
+    db: &PgPool,
+    redis_conn: &ConnectionManager,
+    active_jobs: &[String],
+    snapshot_config: Option<&SnapshotConfig>,
+) -> SnapshotStats {
+    let Some(config) = snapshot_config else {
+        return SnapshotStats {
+            enabled: false,
+            last_published_cursor: None,
+            settled_since: None,
+            status: String::new(),
+        };
+    };
+
+    match config.collect_stats(db, redis_conn, active_jobs).await {
+        Ok(s) => SnapshotStats {
+            enabled: true,
+            last_published_cursor: s.last_published_cursor,
+            settled_since: s.settled_since,
+            status: s.status,
+        },
+        Err(e) => {
+            warn!("Failed to collect snapshot stats: {e:#}");
+            SnapshotStats {
+                enabled: true,
+                last_published_cursor: None,
+                settled_since: None,
+                status: "Feil ved henting av status".to_string(),
+            }
+        }
+    }
+}
+
 async fn stats_ws(
     axum::extract::State(state): axum::extract::State<WebState>,
     upgrade: WebSocketUpgrade,
@@ -714,14 +750,12 @@ async fn stats_ws_handler(mut socket: ws::WebSocket, state: WebState) {
     let mut slow_tick = interval(Duration::from_secs(3));
 
     let mut conn = state.redis_conn.clone();
+    let active_jobs = state.job_tracker.active_jobs();
     send!(
         socket,
         StatsMessage::Queues(fetch_queue_stats(&mut conn).await)
     );
-    send!(
-        socket,
-        StatsMessage::ActiveJobs(state.job_tracker.active_jobs())
-    );
+    send!(socket, StatsMessage::ActiveJobs(active_jobs.clone()));
     send!(
         socket,
         StatsMessage::Outbox(fetch_outbox_stats(&state.db).await)
@@ -730,6 +764,18 @@ async fn stats_ws_handler(mut socket: ws::WebSocket, state: WebState) {
         socket,
         StatsMessage::Articles(fetch_article_stats(&state.db).await)
     );
+    send!(
+        socket,
+        StatsMessage::Snapshot(
+            fetch_snapshot_stats(
+                &state.db,
+                &conn,
+                &active_jobs,
+                state.snapshot_config.as_ref(),
+            )
+            .await
+        )
+    );
 
     fast_tick.reset();
     slow_tick.reset();
@@ -737,12 +783,26 @@ async fn stats_ws_handler(mut socket: ws::WebSocket, state: WebState) {
     loop {
         tokio::select! {
             _ = fast_tick.tick() => {
+                let active_jobs = state.job_tracker.active_jobs();
                 send!(socket, StatsMessage::Queues(fetch_queue_stats(&mut conn).await));
-                send!(socket, StatsMessage::ActiveJobs(state.job_tracker.active_jobs()));
+                send!(socket, StatsMessage::ActiveJobs(active_jobs));
             }
             _ = slow_tick.tick() => {
+                let active_jobs = state.job_tracker.active_jobs();
                 send!(socket, StatsMessage::Outbox(fetch_outbox_stats(&state.db).await));
                 send!(socket, StatsMessage::Articles(fetch_article_stats(&state.db).await));
+                send!(
+                    socket,
+                    StatsMessage::Snapshot(
+                        fetch_snapshot_stats(
+                            &state.db,
+                            &conn,
+                            &active_jobs,
+                            state.snapshot_config.as_ref(),
+                        )
+                        .await
+                    )
+                );
             }
             msg = socket.recv() => {
                 match msg {

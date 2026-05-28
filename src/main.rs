@@ -386,6 +386,7 @@ async fn run(
         sweep_storage: sweep_storage.clone(),
         fetch_article_list_storage: fetch_article_list_storage.clone(),
         fetch_dict_metadata_storage: fetch_dict_metadata_storage.clone(),
+        snapshot_config: snapshot_config.clone(),
         secret_hash: std::env::var("MGMT_UI_SECRET_HASH").ok(),
         session_key: rand::random(),
         #[cfg(feature = "dev_ui")]

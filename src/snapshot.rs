@@ -44,6 +44,12 @@ const SNAPSHOT_PUBLISH_LOCK_KEY: i64 = 6_532_612_785_587_035_142;
 pub const POLL_SCHEDULE: &str = "0 */5 * * * *";
 const SNAPSHOT_EXCLUDE_TABLE_DATA: &[&str] = &["job_outbox"];
 
+pub struct SnapshotStatus {
+    pub last_published_cursor: Option<String>,
+    pub settled_since: Option<String>,
+    pub status: String,
+}
+
 struct SnapshotPublishLock {
     conn: PgConnection,
 }
@@ -248,6 +254,50 @@ impl SnapshotConfig {
         store_state(db, LAST_PUBLISHED_CURSOR_KEY, &cursor_str).await?;
         store_state(db, SETTLED_SINCE_KEY, &Utc::now().to_rfc3339()).await?;
         Ok(())
+    }
+
+    pub async fn collect_stats(
+        &self,
+        db: &PgPool,
+        redis_conn: &ConnectionManager,
+        active_jobs: &[String],
+    ) -> Result<SnapshotStatus> {
+        let last_published_cursor = load_state(db, LAST_PUBLISHED_CURSOR_KEY).await?;
+        let settled_cursor = load_state(db, SETTLED_CURSOR_KEY).await?;
+        let settled_since = load_state(db, SETTLED_SINCE_KEY).await?;
+
+        let state = collect_state(db, redis_conn, active_jobs).await?;
+        let is_publishing = active_jobs
+            .iter()
+            .any(|j| j.starts_with("Publish snapshot"));
+
+        let is_up_to_date =
+            last_published_cursor.is_some() && last_published_cursor == settled_cursor;
+
+        let status = if is_publishing {
+            "Publiserer…".to_string()
+        } else if is_up_to_date {
+            "Oppdatert".to_string()
+        } else if !is_settled(&state) {
+            "Ustabilt, ventar".to_string()
+        } else if let Some(ref since) = settled_since {
+            let elapsed = Utc::now() - parse_rfc3339_utc(since).unwrap_or_else(Utc::now);
+            let remaining = self.settled_window - elapsed;
+
+            if remaining > Duration::zero() {
+                format!("Stabilisert, ventar {}s", remaining.num_seconds())
+            } else {
+                "Klar til publisering".to_string()
+            }
+        } else {
+            "Ventar på stabilisering…".to_string()
+        };
+
+        Ok(SnapshotStatus {
+            last_published_cursor,
+            settled_since,
+            status,
+        })
     }
 
     async fn publish(&self, db: &PgPool, cursor: DateTime<Utc>) -> Result<()> {

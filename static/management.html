@@ -471,6 +471,22 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         white-space: nowrap;
         border: 0;
       }
+
+      #snapshot-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        font-size: 0.88rem;
+      }
+
+      #snapshot-list li {
+        padding: 0.25rem 0;
+      }
+
+      #snapshot-list .mono {
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
+      }
     </style>
   </head>
   <body>
@@ -505,6 +521,11 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         <button id="btn-clear-all" class="danger">Tøm alt</button>
       </div>
     </details>
+
+    <section id="snapshot-section">
+      <h2>Snapshot</h2>
+      <ul id="snapshot-list"></ul>
+    </section>
 
     <section>
       <h2>
@@ -622,6 +643,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
       const articleBody = document.querySelector("#article-table tbody");
       const activeElement = document.querySelector("#active-jobs");
       const toastElement = document.querySelector("#toast");
+      const snapshotList = document.querySelector("#snapshot-list");
 
       let paused = false;
       let ws = null;
@@ -759,6 +781,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
       const dictionaries = window.__CONFIG__?.dictionaries || [];
       const queueNamespaces = window.__CONFIG__?.queueNamespaces || [];
+      const snapshotsEnabled = window.__CONFIG__?.snapshotsEnabled ?? false;
 
       render({
         articles: dictionaries.map((dictionary) => ({
@@ -783,13 +806,18 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
           done: 0,
         })),
         active_jobs: [],
+        snapshot: {
+          enabled: snapshotsEnabled,
+          last_published_cursor: null,
+          settled_since: null,
+          status: null,
+        },
       });
 
       {
-        const res = await fetch("/api/auth-status");
-        const { auth_required } = await res.json();
+        const authRequired = window.__CONFIG__?.authRequired ?? true;
 
-        if (!auth_required) {
+        if (!authRequired) {
           noAuthWarning.classList.remove("hidden");
         } else {
           document.querySelector("#logout-form").classList.remove("hidden");
@@ -825,6 +853,9 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             case "articles":
               renderArticles(msg.data);
               break;
+            case "snapshot":
+              renderSnapshot(msg.data);
+              break;
           }
 
           if (!trendsEnabled) {
@@ -847,7 +878,7 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
         });
       }
 
-      function render({ queues, outbox, articles, active_jobs }) {
+      function render({ queues, outbox, articles, active_jobs, snapshot }) {
         if (articles) {
           renderArticles(articles);
         }
@@ -862,6 +893,10 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
 
         if (active_jobs) {
           renderActiveJobs(active_jobs);
+        }
+
+        if (snapshot) {
+          renderSnapshot(snapshot);
         }
       }
 
@@ -969,6 +1004,111 @@ along with Ordbok API. If not, see <https://www.gnu.org/licenses/>.
             li.className = "";
           });
         }
+      }
+
+      const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+      function relativeTime(date) {
+        const diffMs = date - Date.now();
+        const units = [
+          ["year", 365.25 * 24 * 60 * 60 * 1000],
+          ["month", 30.44 * 24 * 60 * 60 * 1000],
+          ["day", 24 * 60 * 60 * 1000],
+          ["hour", 60 * 60 * 1000],
+          ["minute", 60 * 1000],
+          ["second", 1000],
+        ];
+
+        for (const [unit, ms] of units) {
+          if (Math.abs(diffMs) >= ms || unit === "second") {
+            return rtf.format(Math.round(diffMs / ms), unit);
+          }
+        }
+      }
+
+      function formatCursor(cursor) {
+        if (!cursor) {
+          return null;
+        }
+
+        try {
+          const date = new Date(cursor);
+
+          return {
+            absolute: date.toLocaleString(undefined, {
+              timeZone: "UTC",
+              timeZoneName: "short",
+            }),
+            relative: relativeTime(date),
+          };
+        } catch {
+          return { absolute: cursor, relative: null };
+        }
+      }
+
+      function renderSnapshot(s) {
+        const items = [];
+
+        if (!s.enabled) {
+          items.push({
+            text: "Biletpublisering er ikkje aktivert.",
+            muted: true,
+          });
+        } else {
+          items.push({ label: "Status", text: s.status || "–" });
+          items.push({
+            label: "Sist publisert",
+            cursor: formatCursor(s.last_published_cursor) ?? false,
+          });
+          items.push({
+            label: "Køane stabile sidan",
+            cursor: formatCursor(s.settled_since) ?? false,
+          });
+        }
+
+        while (snapshotList.children.length > items.length) {
+          snapshotList.removeChild(snapshotList.lastChild);
+        }
+
+        while (snapshotList.children.length < items.length) {
+          snapshotList.appendChild(document.createElement("li"));
+        }
+
+        items.forEach(({ label, text, cursor, muted }, i) => {
+          const li = snapshotList.children[i];
+
+          li.className = muted ? "muted" : "";
+          li.innerHTML = "";
+
+          if (label) {
+            const labelSpan = document.createElement("span");
+
+            labelSpan.className = "muted";
+            labelSpan.textContent = `${label}: `;
+            li.appendChild(labelSpan);
+          }
+
+          if (cursor) {
+            const absSpan = document.createElement("span");
+
+            absSpan.className = "mono";
+            absSpan.textContent = cursor.absolute;
+
+            li.appendChild(absSpan);
+
+            if (cursor.relative) {
+              const relSpan = document.createElement("span");
+
+              relSpan.className = "muted";
+              relSpan.textContent = ` (${cursor.relative})`;
+              li.appendChild(relSpan);
+            }
+          } else {
+            li.appendChild(
+              document.createTextNode(cursor === false ? "–" : (text ?? "–")),
+            );
+          }
+        });
       }
 
       async function doAction(url, btn) {

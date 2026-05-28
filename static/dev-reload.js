@@ -40,5 +40,5 @@ ws.addEventListener("message", () => {
 });
 
 ws.addEventListener("close", () => {
-  setTimeout(connect, 2000);
+  setTimeout(() => location.reload(), 2000);
 });
