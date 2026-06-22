@@ -907,9 +907,9 @@ dependencies = [
 
 [[package]]
 name = "axum-governor"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aca10cfdb0b0a1be23df58da590f958f8b136a52a6da637855a5ea4db6e159bc"
+checksum = "70d6071e3268801e665213b22b0e08c5f10238fe277d304831f22699d1fa7181"
 dependencies = [
  "axum",
  "dashmap",
