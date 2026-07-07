@@ -79,7 +79,7 @@ dotenvy = { version = "0.15.7", optional = true }
 matrix-sdk = { version = "0.17.0", optional = true, default-features = false, features = [
   "markdown",
 ] }
-sentry = { version = "0.48.2", optional = true, default-features = false, features = [
+sentry = { version = "0.48.4", optional = true, default-features = false, features = [
   "anyhow",
   "backtrace",
   "contexts",
