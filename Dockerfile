@@ -19,7 +19,7 @@
 # -----------------------------------------
 # Chef stage
 # -----------------------------------------
-FROM rust:1.96.1 AS chef
+FROM rust:1.97.0 AS chef
 RUN cargo install --locked cargo-chef
 WORKDIR /usr/src/ordbokapi-worker
 
