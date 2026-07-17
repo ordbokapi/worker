@@ -46,7 +46,7 @@ hmac = "0.13.0"
 ipnet = "2.12.0"
 meilisearch-sdk = "0.33.0"
 num_cpus = "1.17.0"
-redis = { version = "1.4.0", features = [
+redis = { version = "1.4.1", features = [
   "aio",
   "connection-manager",
   "tokio-comp",
