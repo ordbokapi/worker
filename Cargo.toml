@@ -22,7 +22,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 apalis = { version = "1.0.0-rc.9", features = [
   "retry",
   "timeout",
