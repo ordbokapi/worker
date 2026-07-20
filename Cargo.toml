@@ -37,7 +37,7 @@ aws-config = "1.9.0"
 aws-sdk-s3 = "1.138.1"
 axum = { version = "0.8.9", features = ["ws"] }
 axum-governor = "2.0.3"
-clap = { version = "4.6.2", features = ["derive", "wrap_help"] }
+clap = { version = "4.6.3", features = ["derive", "wrap_help"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 cron = "0.16.0"
 base16ct = { version = "1.0.0", features = ["alloc"] }
