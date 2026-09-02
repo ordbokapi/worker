@@ -76,7 +76,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 urlencoding = "2.1.3"
 dotenvy = { version = "0.15.7", optional = true }
-matrix-sdk = { version = "0.17.0", optional = true, default-features = false, features = [
+matrix-sdk = { version = "0.18.0", optional = true, default-features = false, features = [
   "markdown",
 ] }
 sentry = { version = "0.48.2", optional = true, default-features = false, features = [
