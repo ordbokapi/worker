@@ -90,7 +90,7 @@ sentry = { version = "0.48.2", optional = true, default-features = false, featur
 ] }
 rand = "0.10.4"
 indexmap = "2.14.2"
-notify = { version = "8.2.0", optional = true }
+notify = { version = "8.2.2", optional = true }
 tempfile = "3.27.0"
 
 [features]
