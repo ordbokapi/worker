@@ -23,16 +23,16 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-apalis = { version = "1.0.0-rc.9", features = [
+apalis = { version = "1.2.0", features = [
   "retry",
   "timeout",
   "limit",
   "catch-panic",
   "tracing",
 ] }
-apalis-core = "1.0.0-rc.9"
-apalis-redis = "1.0.0-rc.8"
-apalis-cron = "1.0.0-rc.8"
+apalis-core = "1.2.0"
+apalis-redis = "1.1.1"
+apalis-cron = "1.1.0"
 aws-config = "1.13.3"
 aws-sdk-s3 = "1.161.0"
 axum = { version = "0.8.9", features = ["ws"] }
